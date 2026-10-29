@@ -1,13 +1,23 @@
-"""机会接口层：越权、错误码、请求体白名单、看板形状与路由顺序。
+"""机会接口层：越权、错误码、请求体白名单、线上形状、看板列与分页校验。
 
-服务层的规则已在 test_opportunities.py 钉过，这里只测服务层测不到的三件事：
+服务层的规则已在 test_opportunities.py 钉过，这里测的是**只有过一遍 HTTP 才成立**
+的东西：
 
-1. 真的走 HTTP 之后越权是 403（不是 404、不是空列表）；
-2. 请求体里出现不该写的字段（`stage` / `owner_id` / `won_at`）必须是 422，
+1. 越权与非法输入的网络语义：403 / 400 / 404 / 422 各自带上正确的 ``code``，
+   不是被全局处理器改写成 404、也不是空列表；
+2. 请求体白名单：`stage` / `owner_id` / `won_at` 出现在 PATCH 或 POST 体里是 422，
    而不是被静默丢弃；
-3. `/opportunities/board` 没有被 `/{opportunity_id}` 抢走——FastAPI 按声明顺序
-   匹配，写反了 "board" 会被当 int 解析成 422，而列表页和看板会一起坏掉。
+3. 线上形状：金额是定点字符串（``"8000.00"``）、`win_rate` 是生效值而
+   `win_rate_manual` 标明是否手改过、`customer_name` / `owner_name` 由服务端预加载；
+4. `/opportunities/board` 没有被 `/{opportunity_id}` 抢走——FastAPI 按声明顺序
+   匹配，写反了 "board" 会被当 int 解析成 422；看板固定六列且聚合口径正确；
+5. 分页参数在参数层就被挡住（``page=0`` / ``page_size=201``），不能变成
+   ``OFFSET -20`` 或超大 OFFSET 打到库里；
+6. 公海客户建机会这条 admin-only 分支：管理员是本轮唯一能走到"客户没有负责人"
+   那一步的角色（sales/manager 先拿到 403），因此它只能在 HTTP 层验证。
 """
+
+from sqlalchemy import select
 
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
@@ -49,6 +59,9 @@ def _setup(db):
         "sb": sb,
         "cust_a": create_customer(db, sa, CustomerCreate(name="甲制造有限公司")),
         "cust_b": create_customer(db, sb, CustomerCreate(name="乙制造有限公司")),
+        # 管理员不指定负责人 → 公海客户（owner_id 为空），用于钉住"公海建不了机会"
+        # 这条只有 admin 能走到的 400 分支
+        "cust_pool": create_customer(db, admin, CustomerCreate(name="丙制造有限公司")),
     }
 
 
@@ -194,38 +207,61 @@ def test_api_foreign_opportunity_is_403(client, db):
     foreign = _make(db, f["sb"], f["cust_b"], name="乙公司机会")
     headers = _auth(_token(client, "sales_a"))
 
-    assert (
-        client.get(f"/api/v1/opportunities/{foreign.id}", headers=headers).status_code
-        == 403
-    )
+    detail = client.get(f"/api/v1/opportunities/{foreign.id}", headers=headers)
+    assert detail.status_code == 403
+    assert detail.json()["code"] == "forbidden"
+
     patched = client.patch(
         f"/api/v1/opportunities/{foreign.id}", headers=headers, json={"name": "改别人的"}
     )
     assert patched.status_code == 403
     assert patched.json()["code"] == "forbidden"
-    assert (
-        client.post(
-            f"/api/v1/opportunities/{foreign.id}/stage",
-            headers=headers,
-            json={"stage": "needs"},
-        ).status_code
-        == 403
+
+    moved = client.post(
+        f"/api/v1/opportunities/{foreign.id}/stage",
+        headers=headers,
+        json={"stage": "needs"},
     )
-    assert (
-        client.delete(f"/api/v1/opportunities/{foreign.id}", headers=headers).status_code
-        == 403
-    )
+    assert moved.status_code == 403
+    assert moved.json()["code"] == "forbidden"
+
+    deleted = client.delete(f"/api/v1/opportunities/{foreign.id}", headers=headers)
+    assert deleted.status_code == 403
+    assert deleted.json()["code"] == "forbidden"
+
     filtered = client.get(
         f"/api/v1/opportunities?customer_id={f['cust_b'].id}", headers=headers
     )
     assert filtered.status_code == 403
     assert filtered.json()["code"] == "forbidden"
-    assert (
-        client.get(
-            f"/api/v1/opportunities/board?customer_id={f['cust_b'].id}", headers=headers
-        ).status_code
-        == 403
+
+    board = client.get(
+        f"/api/v1/opportunities/board?customer_id={f['cust_b'].id}", headers=headers
     )
+    assert board.status_code == 403
+    assert board.json()["code"] == "forbidden"
+
+
+def test_api_admin_cannot_create_opportunity_on_public_pool_customer(client, db):
+    """公海客户没有负责人，而机会 ``owner_id`` 是 NOT NULL：管理员也一样是 400。
+
+    这条分支只有管理员走得到——sales/manager 对公海客户先被
+    ``assert_customer_writable`` 挡成 403，服务层测试已覆盖；HTTP 层此前为零覆盖。
+    """
+    f = _setup(db)
+    admin_headers = _auth(_token(client, "admin"))
+
+    resp = client.post(
+        "/api/v1/opportunities",
+        headers=admin_headers,
+        json={"customer_id": f["cust_pool"].id, "name": "公海建单"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_value"
+    assert "负责人" in resp.json()["message"]
+    # 400 不能是"先写后报错"：库里一条机会都不该留下
+    assert db.execute(select(Opportunity.id)).all() == []
 
 
 def test_api_delete_needs_manager(client, db):
@@ -323,11 +359,15 @@ def test_api_invalid_values_and_missing_records(client, db):
 
 
 def test_api_page_params_are_validated(client, db):
-    """``page=0`` 必须在参数层变 422，不能算成 ``OFFSET -20`` 打到库里。"""
+    """分页上/下界必须在参数层变 422。
+
+    ``page=0`` 会算成 ``OFFSET -20``（PG 直接报错 → 500）；``page_size=201`` 说明
+    有人绕过了 ``PageParams`` 的上界，一次就能把整张表拉进内存。
+    """
     _setup(db)
     headers = _auth(_token(client, "sales_a"))
 
-    resp = client.get("/api/v1/opportunities?page=0", headers=headers)
-
-    assert resp.status_code == 422
-    assert resp.json()["code"] == "validation_error"
+    for query in ("page=0", "page_size=201"):
+        resp = client.get(f"/api/v1/opportunities?{query}", headers=headers)
+        assert resp.status_code == 422, query
+        assert resp.json()["code"] == "validation_error"

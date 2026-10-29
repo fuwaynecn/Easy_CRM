@@ -22,6 +22,8 @@ from app.modules.customers.models import Customer
 from app.modules.departments.models import Department
 from app.modules.lost_reasons.models import LostReason
 from app.modules.opportunities.models import Opportunity, StageHistory
+from app.modules.opportunities.schemas import OpportunityCreate
+from app.modules.opportunities.service import create_opportunity
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
 from scripts.seed import LOST_REASONS, OPPORTUNITIES, SEED_PASSWORD, main, seed
 
@@ -232,3 +234,39 @@ def test_seeded_opportunity_owner_matches_customer(db):
     for opportunity, customer in rows:
         assert customer.owner_id is not None   # 公海客户不该有机会
         assert opportunity.owner_id == customer.owner_id
+
+
+def test_seed_survives_duplicate_opportunity_names(db):
+    """同一客户可以有重名机会，判重不能假定查询结果只有一行。
+
+    回归守卫：``_find_opportunity`` 曾用 ``scalar_one_or_none()``。一个客户允许多个
+    机会（brief 裁定 2），(customer_id, name) 不是唯一键——只要有人用
+    ``POST /opportunities`` 建了一条与种子同名的机会，之后**每次** seed() 都会在
+    ``MultipleResultsFound`` 上崩，而且重跑永远恢复不了。种子的失败方式必须是
+    "跳过"，不能是"炸掉"。
+    """
+    seed(db)
+    customer = db.execute(
+        select(Customer).where(Customer.name == "杭州智造装备有限公司")
+    ).scalar_one()
+    owner = db.get(User, customer.owner_id)
+    for _ in range(2):
+        create_opportunity(
+            db,
+            owner,
+            OpportunityCreate(customer_id=customer.id, name="喷涂产线一期改造"),
+        )
+    same_name_rows = db.execute(
+        select(func.count())
+        .select_from(Opportunity)
+        .where(
+            Opportunity.customer_id == customer.id,
+            Opportunity.name == "喷涂产线一期改造",
+        )
+    ).scalar_one()
+    assert same_name_rows == 3          # 种子 1 条 + 手工建的 2 条
+
+    result = seed(db)                    # 修复前这里抛 MultipleResultsFound
+
+    assert result["opportunities"] == 0  # 第二次执行全部跳过
+    assert _counts(db)["opportunities"] == len(OPPORTUNITIES) + 2

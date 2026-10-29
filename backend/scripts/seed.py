@@ -379,12 +379,24 @@ def _find_opportunity(db: Session, customer_id: int, name: str) -> int | None:
 
     软删的也跳过：删掉再建同名是合法操作，但种子脚本不该在每次执行时把用户**刚
     删掉**的机会重新建出来——那会让"我删了它"变成"它又回来了"。
+
+    **必须 limit(1)**：一个客户可以有多个机会（brief 裁定 2），(customer_id, name)
+    不是唯一键，同一客户下重名机会完全合法。用 ``scalar_one_or_none()`` 的话，只要
+    有人用 ``POST /opportunities`` 建了一条与种子同名的机会，之后每次 seed() 都会
+    在 ``MultipleResultsFound`` 上崩，而且重跑永远恢复不了——种子脚本的失败方式必须
+    是"跳过"，不能是"炸掉"。
     """
-    return db.execute(
-        select(Opportunity.id).where(
-            Opportunity.customer_id == customer_id, Opportunity.name == name
+    return (
+        db.execute(
+            select(Opportunity.id)
+            .where(
+                Opportunity.customer_id == customer_id, Opportunity.name == name
+            )
+            .limit(1)
         )
-    ).scalar_one_or_none()
+        .scalars()
+        .first()
+    )
 
 
 def _seed_opportunities(
