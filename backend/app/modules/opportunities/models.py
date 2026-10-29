@@ -27,6 +27,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    func,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -125,4 +126,48 @@ class Opportunity(Base, TimestampMixin, SoftDeleteMixin):
         CheckConstraint(
             "stage <> 'won' OR won_at IS NOT NULL", name="won_at_required"
         ),
+    )
+
+
+class StageHistory(Base, TimestampMixin):
+    """阶段变更流水（design §3.7）。
+
+    这是漏斗与成交周期报表的**唯一数据来源**，所以只追加、不修改：任何一次阶段
+    变更（含创建）都必须留一行，`amount_snapshot` 记的是变更当刻的金额——机会金额
+    之后还会被改，报表要按当时的值算，不能 join 回 opportunities 取现值。
+
+    ``from_stage`` 为空的唯一场景是创建（从"不存在"进入首个阶段），因此
+    "这一行是不是创建"的判断就是 ``from_stage IS NULL``，不需要额外的 action 列。
+    """
+
+    __tablename__ = "stage_histories"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    opportunity_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("opportunities.id"), nullable=False
+    )
+    from_stage: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    amount_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    operator_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("users.id"), nullable=True
+    )
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_stage_histories_opportunity_id_changed_at",
+            "opportunity_id",
+            "changed_at",
+        ),
+        CheckConstraint(
+            f"from_stage IS NULL OR from_stage IN {_STAGE_SQL}",
+            name="from_stage",
+        ),
+        CheckConstraint(f"to_stage IN {_STAGE_SQL}", name="to_stage"),
     )

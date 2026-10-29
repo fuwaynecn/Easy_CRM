@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import Session
 
@@ -29,6 +30,7 @@ from app.modules.opportunities.models import (
     STAGE_WIN_RATES,
     TERMINAL_STAGES,
     Opportunity,
+    StageHistory,
 )
 from app.modules.users.models import ROLE_SALES
 from app.modules.users.service import create_user
@@ -101,6 +103,37 @@ def test_defaults_and_column_types(db):
     assert opportunity.deleted_at is None
     # 金额列是 numeric(14,2)：入库后必须带两位小数，不能变成浮点
     assert str(opportunity.amount) == "0.00"
+
+
+def test_server_defaults_fill_bare_insert(db):
+    """裸 INSERT 不能因为漏写 stage/amount 就撞 NOT NULL。
+
+    绕开 ORM 的写入路径一直存在（P5 的 Excel 导入、运维手工 SQL），Python 侧的
+    ``default=`` 在那条路径上根本不执行；能兜底的只有 ``server_default``。
+    """
+    owner = _owner(db)
+    customer = _customer(db, owner)
+
+    row = db.execute(
+        text(
+            "INSERT INTO opportunities (customer_id, name, owner_id) "
+            "VALUES (:customer_id, :name, :owner_id) "
+            "RETURNING id, stage, amount"
+        ),
+        {"customer_id": customer.id, "name": "裸插入机会", "owner_id": owner.id},
+    ).one()
+    inserted_id, stage, amount = row
+
+    try:
+        assert stage == "contact"
+        # numeric(14,2) 的 server_default 0 落库后是两位小数，不是浮点 0.0
+        assert amount == Decimal("0.00")
+    finally:
+        # 这条用例绕过了夹具的 ORM 事务，必须自己清掉，否则污染同库后面的用例
+        db.execute(
+            text("DELETE FROM opportunities WHERE id = :id"), {"id": inserted_id}
+        )
+        db.commit()
 
 
 def test_amount_keeps_two_decimals(db):
@@ -192,3 +225,113 @@ def test_relations_are_lazy_raise(db):
 
     # 只断言异常类型（InvalidRequestError）；消息文案随 SQLAlchemy 版本变，别钉死
     assert "lazy" in str(excinfo.value).lower()
+
+
+def test_check_constraint_names_are_frozen(db):
+    """CHECK 约束名必须真的进了数据库。
+
+    `test_migrations.py` 的 ``compare_metadata`` 不比较 CHECK 约束（也没开
+    ``compare_server_default``），所以约束在迁移里写成匿名、或者名字与模型不一致，
+    整套测试都发现不了——只有线上某个裸 INSERT 才暴露。这里直接查 ``pg_constraint``
+    钉住模型声明的名字；断言"包含"而不是"相等"，将来新增约束不该让这条变脆，
+    但已经固化的名字丢了必须炸。
+    """
+    expected = {
+        "opportunities": {
+            "ck_opportunities_stage",
+            "ck_opportunities_win_rate_range",
+            "ck_opportunities_amount_non_negative",
+            "ck_opportunities_lost_reason_required",
+            "ck_opportunities_won_at_required",
+        },
+        "stage_histories": {
+            "ck_stage_histories_from_stage",
+            "ck_stage_histories_to_stage",
+        },
+    }
+
+    for table_name, wanted in expected.items():
+        names = {
+            row[0]
+            for row in db.execute(
+                text(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid = CAST(:table_name AS regclass) "
+                    "AND contype = 'c'"
+                ),
+                {"table_name": table_name},
+            )
+        }
+        assert wanted <= names, f"{table_name} 缺少 CHECK 约束：{wanted - names}"
+
+
+# --- 阶段历史（design §3.7） --------------------------------------------
+
+
+def test_history_accepts_null_from_stage_and_snapshots_amount(db):
+    """创建时的第一条历史：from_stage 为空、to_stage 是初始阶段、带金额快照。"""
+    owner = _owner(db)
+    customer = _customer(db, owner)
+    opportunity = _opportunity(db, owner, customer, amount=Decimal(8800))
+
+    history = StageHistory(
+        opportunity_id=opportunity.id,
+        from_stage=None,
+        to_stage=opportunity.stage,
+        amount_snapshot=opportunity.amount,
+        operator_id=owner.id,
+    )
+    db.add(history)
+    db.commit()
+    db.refresh(history)
+
+    assert history.id is not None
+    assert history.from_stage is None
+    assert history.to_stage == "contact"
+    assert str(history.amount_snapshot) == "8800.00"
+    assert history.changed_at is not None      # server_default now()
+
+
+def test_history_rejects_unknown_stage(db):
+    owner = _owner(db)
+    customer = _customer(db, owner)
+    opportunity = _opportunity(db, owner, customer)
+
+    db.add(
+        StageHistory(
+            opportunity_id=opportunity.id,
+            from_stage="contact",
+            to_stage="prospecting",
+            operator_id=owner.id,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db.flush()
+    db.rollback()
+
+
+def test_history_index_exists(db):
+    """`(opportunity_id, changed_at)` 是漏斗与成交周期报表的取数路径，索引必须真的建了。"""
+    from sqlalchemy import inspect
+
+    indexes = {
+        index["name"] for index in inspect(db.get_bind()).get_indexes("stage_histories")
+    }
+
+    assert "ix_stage_histories_opportunity_id_changed_at" in indexes
+
+
+def test_history_requires_existing_opportunity(db):
+    owner = _owner(db)
+
+    db.add(
+        StageHistory(
+            opportunity_id=999999,
+            from_stage=None,
+            to_stage="contact",
+            operator_id=owner.id,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db.flush()
+    db.rollback()
