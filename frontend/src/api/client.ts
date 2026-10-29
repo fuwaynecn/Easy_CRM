@@ -16,6 +16,7 @@ export class ApiError extends Error {
     public detail?: unknown,
   ) {
     super(message);
+    this.name = "ApiError";
   }
 }
 
@@ -28,12 +29,22 @@ export function tryRefresh(): Promise<boolean> {
       credentials: "include",
     })
       .then(async (resp) => {
-        if (!resp.ok) return false;
-        const data = (await resp.json()) as { access_token: string };
+        if (!resp.ok) {
+          setAccessToken(null);
+          return false;
+        }
+        const data = (await resp.json()) as { access_token?: unknown };
+        if (typeof data.access_token !== "string") {
+          setAccessToken(null);
+          return false;
+        }
         setAccessToken(data.access_token);
         return true;
       })
-      .catch(() => false)
+      .catch(() => {
+        setAccessToken(null);
+        return false;
+      })
       .finally(() => {
         refreshing = null;
       });
