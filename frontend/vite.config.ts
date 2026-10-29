@@ -14,6 +14,12 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    watch: {
+      // 编辑器的原子写入会先建 .xxx.tmpdir/ 临时目录再改名。不排除的话，
+      // vite 的文件监听会去 watch 这些随时消失的临时文件，在 Windows 上
+      // 直接以 EBUSY 让整个 dev server 退出。
+      ignored: ["**/.*.tmpdir/**", "**/*.tmp"],
+    },
     proxy: {
       "/api": {
         target: apiTarget,

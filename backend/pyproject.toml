@@ -14,6 +14,9 @@ dependencies = [
     "pydantic-settings>=2.6",
     "pyjwt>=2.9",
     "pwdlib[argon2]>=0.2",
+    # 我们直接 import ZoneInfo 做 Asia/Shanghai 时区换算。不能靠传递依赖：
+    # python:3.x-slim 这类镜像不带系统时区库，缺失时 ZoneInfo 会抛异常。
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
