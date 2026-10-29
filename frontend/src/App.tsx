@@ -8,6 +8,7 @@ import { AppShell } from "./components/AppShell";
 import CustomerDetailPage from "./pages/CustomerDetailPage";
 import CustomerListPage from "./pages/CustomerListPage";
 import LoginPage from "./pages/LoginPage";
+import OpportunityListPage from "./pages/OpportunityListPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -46,6 +47,17 @@ export default function App() {
                 <RequireAuth>
                   <AppShell>
                     <CustomerDetailPage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            {/* 看板路由（/opportunities/board）属 Task 9，本任务只交付列表页 */}
+            <Route
+              path="/opportunities"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <OpportunityListPage />
                   </AppShell>
                 </RequireAuth>
               }

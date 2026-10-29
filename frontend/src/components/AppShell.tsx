@@ -4,7 +4,10 @@ import { Navigate, NavLink } from "react-router-dom";
 
 import { useAuth } from "../auth/AuthProvider";
 
-const NAV = [{ to: "/customers", label: "客户" }];
+const NAV = [
+  { to: "/customers", label: "客户" },
+  { to: "/opportunities", label: "机会" },
+];
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { user, logout } = useAuth();
