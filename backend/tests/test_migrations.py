@@ -1,8 +1,13 @@
 """迁移与模型的漂移守护。
 
 测试夹具用 ``Base.metadata.create_all`` 建表，生产用 Alembic 迁移，这是两个真值源：
-迁移漏了某列时全部测试照样通过，只有线上才撞 NOT NULL / UndefinedColumn。本用例把
-测试库清空后用 Alembic 从零升到 head，再用 autogenerate 比对模型，差异非空即失败。
+迁移漏了某列时全部测试照样通过，只有线上才撞 NOT NULL / UndefinedColumn。本文件把
+测试库清空后用 Alembic 从零升到 head，再从两个角度检查这份**迁移产物**：
+
+- ``compare_metadata`` 比对模型与迁移（含类型与 server_default），有差异即失败；
+- 直接查 ``pg_constraint`` 与裸 INSERT：CHECK 约束名、``server_default`` 是否真的落在
+  迁移建出的表上。``compare_metadata`` 不比较 CHECK 约束，约束在迁移里被改名或删掉它
+  不会报；这类只在迁移文件里改坏、模型没动的问题只有这里能发现。
 """
 
 from pathlib import Path
@@ -20,26 +25,53 @@ from app.db.base import Base
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = BACKEND_DIR / "alembic.ini"
 
+# 迁移里显式命名的 CHECK 约束。名字进首个迁移即固化，之后改名等于线上约束换了名字，
+# 依赖约束名的排查与运维脚本会静默失效，所以这里按集合包含钉死（新增约束不算漂移）。
+CHECK_CONSTRAINT_NAMES = {
+    "opportunities": {
+        "ck_opportunities_stage",
+        "ck_opportunities_win_rate_range",
+        "ck_opportunities_amount_non_negative",
+        "ck_opportunities_lost_reason_required",
+        "ck_opportunities_won_at_required",
+    },
+    "stage_histories": {
+        "ck_stage_histories_from_stage",
+        "ck_stage_histories_to_stage",
+    },
+}
+
 
 def _render(diff: list[object]) -> str:
     return "\n".join(f"  - {item}" for item in diff)
 
 
-def test_migrations_match_models(engine: Engine) -> None:
+def _upgrade_to_head(engine: Engine) -> None:
+    """清空 public schema 后从零升到 head。
+
+    ``env.py`` 优先用 ``config.attributes["connection"]``（外部连接模式），迁移因此落在
+    ``easycrm_test`` 而不是开发库；``engine.begin()`` 负责提交/回滚。
+    """
     with engine.begin() as conn:
         conn.execute(text("DROP SCHEMA public CASCADE"))
         conn.execute(text("CREATE SCHEMA public"))
 
     config = Config(str(ALEMBIC_INI))
-    # 外部连接模式：env.py 优先用 config.attributes["connection"]，不再自己建引擎，
-    # 保证迁移落在 easycrm_test 而不是开发库。engine.begin() 负责提交/回滚。
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         command.upgrade(config, "head")
 
+
+def test_migrations_match_models(engine: Engine) -> None:
+    _upgrade_to_head(engine)
+
     with engine.connect() as connection:
         context = MigrationContext.configure(
-            connection, opts={"compare_type": True}
+            connection,
+            # compare_server_default 必须开：只比列与类型时，迁移里被删掉的
+            # server_default 在模型侧看不出来（夹具走 create_all，默认值来自模型），
+            # 线上却会在裸 INSERT 时才撞 NOT NULL。
+            opts={"compare_type": True, "compare_server_default": True},
         )
         diff = compare_metadata(context, Base.metadata)
 
@@ -47,3 +79,62 @@ def test_migrations_match_models(engine: Engine) -> None:
         "Alembic 迁移与 SQLAlchemy 模型不一致（共 "
         f"{len(diff)} 项），请补一条迁移或修正模型：\n{_render(diff)}"
     )
+
+
+def test_migrated_schema_keeps_named_checks_and_column_defaults(engine: Engine) -> None:
+    """约束名与 server_default 的守卫必须打在迁移产物上。
+
+    ``conftest.py`` 的 ``db`` 夹具用 ``Base.metadata.create_all`` 建表，那边查到的约束名
+    与默认值全部来自模型；迁移文件里把 CHECK 改名、或删掉 ``server_default``，模型侧一条
+    都不会红。这里用 ``command.upgrade`` 建出的表直接查 ``pg_constraint``、再裸 INSERT
+    验证默认值确实生效。
+    """
+    _upgrade_to_head(engine)
+
+    with engine.begin() as connection:
+        for table_name, wanted in CHECK_CONSTRAINT_NAMES.items():
+            names = {
+                row[0]
+                for row in connection.execute(
+                    text(
+                        "SELECT conname FROM pg_constraint "
+                        "WHERE conrelid = CAST(:table_name AS regclass) "
+                        "AND contype = 'c'"
+                    ),
+                    {"table_name": table_name},
+                )
+            }
+            assert wanted <= names, f"{table_name} 缺少 CHECK 约束：{wanted - names}"
+
+        # 裸 INSERT 只给必填列：默认值若没进迁移产物，这里撞的是 NOT NULL，
+        # 不是"断言失败"——两种都红，正是这条用例要的。
+        owner_id = connection.execute(
+            text(
+                "INSERT INTO users (username, password_hash, display_name, role) "
+                "VALUES ('migration-probe', 'x', '迁移探针', 'sales') RETURNING id"
+            )
+        ).scalar_one()
+        customer_id = connection.execute(
+            text("INSERT INTO customers (name) VALUES ('迁移探针客户') RETURNING id")
+        ).scalar_one()
+        opportunity_id, stage, amount = connection.execute(
+            text(
+                "INSERT INTO opportunities (customer_id, name, owner_id) "
+                "VALUES (:customer_id, '裸插入机会', :owner_id) "
+                "RETURNING id, stage, amount"
+            ),
+            {"customer_id": customer_id, "owner_id": owner_id},
+        ).one()
+        assert stage == "contact"
+        # 用 str 比较而不是 Decimal("0.00")：Decimal("0") == Decimal("0.00") 为真，
+        # 那样比不出 numeric(14,2) 的 scale。
+        assert str(amount) == "0.00"
+
+        history_changed_at = connection.execute(
+            text(
+                "INSERT INTO stage_histories (opportunity_id, to_stage) "
+                "VALUES (:opportunity_id, 'contact') RETURNING changed_at"
+            ),
+            {"opportunity_id": opportunity_id},
+        ).scalar_one()
+        assert history_changed_at is not None
