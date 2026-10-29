@@ -21,7 +21,13 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
+from app.core.errors import (
+    ConflictError,
+    ForbiddenError,
+    InvalidValueError,
+    NotFoundError,
+)
+from app.modules.contacts import service as contacts_service
 from app.modules.contacts.models import Contact
 from app.modules.contacts.schemas import ContactCreate, ContactUpdate
 from app.modules.contacts.service import (
@@ -240,6 +246,43 @@ def test_database_rejects_two_primary_contacts(db):
     db.rollback()
 
     assert _primaries(db, f["cust_a"].id) == []
+
+
+def test_concurrent_primary_create_returns_409(db, monkeypatch):
+    """并发下"先清旧的"失效时，后提交者撞部分唯一索引必须 409，不能 500。"""
+    f = _setup(db)
+    create_contact(
+        db, f["sa"], f["cust_a"].id, ContactCreate(name="王工", is_primary=True)
+    )
+    # 模拟另一事务在我们清理之后、提交之前插入的主联系人。
+    monkeypatch.setattr(contacts_service, "_clear_other_primaries", lambda *a, **k: None)
+
+    with pytest.raises(ConflictError) as exc:
+        create_contact(
+            db, f["sa"], f["cust_a"].id, ContactCreate(name="李工", is_primary=True)
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.message == "该客户已有主联系人，请刷新后重试"
+    db.expire_all()
+    assert len(_primaries(db, f["cust_a"].id)) == 1
+
+
+def test_concurrent_primary_update_returns_409(db, monkeypatch):
+    f = _setup(db)
+    first = create_contact(
+        db, f["sa"], f["cust_a"].id, ContactCreate(name="王工", is_primary=True)
+    )
+    second = create_contact(db, f["sa"], f["cust_a"].id, ContactCreate(name="李工"))
+    monkeypatch.setattr(contacts_service, "_clear_other_primaries", lambda *a, **k: None)
+
+    with pytest.raises(ConflictError) as exc:
+        update_contact(db, f["sa"], second.id, ContactUpdate(is_primary=True))
+
+    assert exc.value.status_code == 409
+    db.expire_all()
+    assert db.get(Contact, first.id).is_primary is True
+    assert db.get(Contact, second.id).is_primary is False
 
 
 def test_soft_deleted_primary_frees_the_slot(db):
@@ -599,39 +642,25 @@ def test_api_create_list_patch_delete(client, db):
     )
 
 
-def test_api_nested_contact_routes_alias_flat_ones(client, db):
-    """嵌套形式的 PATCH/DELETE 与扁平路由等价；客户与联系人必须对得上。
-
-    两种形式都保留：brief/spec §5 用 ``/contacts/{id}``，派单要求嵌套路径，
-    前端无论拿哪一种都能用；``customer_id`` 与联系人不匹配时按不存在处理（404）。
-    """
+@pytest.mark.parametrize("method", ["patch", "delete"])
+def test_api_nested_contact_write_routes_are_removed(client, db, method):
+    """写操作只保留 ``/contacts/{id}``：重复的嵌套实现已删除，不得再被调用到。"""
     f = _setup(db)
     headers = _auth(_token(client, "sales_a"))
-    created = client.post(
-        f"/api/v1/customers/{f['cust_a'].id}/contacts",
-        headers=headers,
-        json={"name": "王工"},
-    ).json()
+    contact = create_contact(db, f["sa"], f["cust_a"].id, ContactCreate(name="王工"))
+    kwargs = {"json": {"title": "采购"}} if method == "patch" else {}
 
-    mismatched = client.patch(
-        f"/api/v1/customers/{f['cust_b'].id}/contacts/{created['id']}",
+    resp = getattr(client, method)(
+        f"/api/v1/customers/{f['cust_a'].id}/contacts/{contact.id}",
         headers=headers,
-        json={"phone": "139"},
+        **kwargs,
     )
-    assert mismatched.status_code == 404
 
-    nested_patch = client.patch(
-        f"/api/v1/customers/{f['cust_a'].id}/contacts/{created['id']}",
-        headers=headers,
-        json={"title": "采购"},
-    )
-    assert nested_patch.status_code == 200
-    assert nested_patch.json()["title"] == "采购"
-
-    nested_delete = client.delete(
-        f"/api/v1/customers/{f['cust_a'].id}/contacts/{created['id']}", headers=headers
-    )
-    assert nested_delete.status_code == 204
+    assert resp.status_code == 404
+    db.expire_all()
+    row = db.get(Contact, contact.id)
+    assert row.title is None
+    assert row.deleted_at is None
 
 
 def test_api_foreign_contact_access_is_403(client, db):

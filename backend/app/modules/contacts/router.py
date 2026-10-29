@@ -4,17 +4,14 @@
 ``assert_customer_writable``。规则留在 service 里，换一个入口（导入、前端批量操作）
 才不会漏。
 
-路径有两套写法，语义完全一致：
+路径只有一套：
 
-- ``GET/POST /customers/{customer_id}/contacts``：联系人挂在客户下，新增时必须
-  带父 id，这是 brief/spec 的写法；
-- ``PATCH/DELETE /contacts/{contact_id}``：扁平写法（spec §5 ``CRUD /contacts``），
-  联系人的 id 全局唯一，改/删不需要父 id；
-- ``PATCH/DELETE /customers/{customer_id}/contacts/{contact_id}``：派单要求的嵌套
-  写法，作为扁平路由的别名保留，并且会校验 ``customer_id`` 确实是该联系人的父记录
-  （对不上 404），免得"用 A 客户的路径改到 B 客户的联系人"。
+- ``GET/POST /customers/{customer_id}/contacts``：列表与新增必须带父 id；
+- ``PATCH/DELETE /contacts/{contact_id}``：联系人的 id 全局唯一，改/删不需要父 id
+  （spec §5 ``CRUD /contacts``）。
 
-两种写法共用一个 service 函数，不存在两套逻辑。
+``/customers/{customer_id}/contacts/{contact_id}`` 的嵌套写路由曾作为别名存在，
+现已删除：同一条规则维护两份实现只会让两边的校验慢慢漂移。
 """
 
 from typing import Annotated
@@ -75,28 +72,4 @@ def remove_contact(
     user: CurrentUser,
 ):
     delete_contact(db, user, contact_id)
-    return Response(status_code=204)
-
-
-@router.patch(
-    "/customers/{customer_id}/contacts/{contact_id}", response_model=ContactRead
-)
-def patch_nested_contact(
-    customer_id: int,
-    contact_id: int,
-    payload: ContactUpdate,
-    db: Annotated[Session, Depends(get_db)],
-    user: CurrentUser,
-):
-    return update_contact(db, user, contact_id, payload, customer_id=customer_id)
-
-
-@router.delete("/customers/{customer_id}/contacts/{contact_id}", status_code=204)
-def remove_nested_contact(
-    customer_id: int,
-    contact_id: int,
-    db: Annotated[Session, Depends(get_db)],
-    user: CurrentUser,
-):
-    delete_contact(db, user, contact_id, customer_id=customer_id)
     return Response(status_code=204)

@@ -19,9 +19,10 @@
 from datetime import UTC, datetime
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.errors import InvalidValueError, NotFoundError
+from app.core.errors import ConflictError, InvalidValueError, NotFoundError
 from app.db.scope import assert_customer_writable
 from app.modules.contacts.models import DECISION_ROLES, Contact
 from app.modules.contacts.schemas import ContactCreate, ContactUpdate
@@ -30,6 +31,10 @@ from app.modules.users.models import User
 
 # 库里的 NOT NULL 列：显式传 null 不能落库，按取值非法（400）处理而不是撞 500
 _REQUIRED_FIELDS = {"name": "联系人姓名", "is_primary": "是否主联系人"}
+
+# 并发设主联系人时，后提交的事务会撞 uq_contacts_customer_primary。这是"与现有
+# 数据冲突"（409），不是服务端错误（500）：提示用户刷新后重试即可。
+_PRIMARY_CONFLICT_MESSAGE = "该客户已有主联系人，请刷新后重试"
 
 
 def _validate_decision_role(role: str | None) -> None:
@@ -121,26 +126,23 @@ def create_contact(
     )
     db.add(contact)
     # 客户本身不在这里刷新：design §3.3 的三个同步点不含联系人操作
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # 并发下另一个事务已经设了主联系人：唯一索引替我们兜住了坏数据，
+        # 这里把"撞约束"翻译成可重试的 409。
+        db.rollback()
+        raise ConflictError(_PRIMARY_CONFLICT_MESSAGE) from exc
     db.refresh(contact)
     return contact
 
 
-def _get_owned_contact(
-    db: Session, actor: User, contact_id: int, customer_id: int | None = None
-) -> Contact:
-    """取一条可写联系人：先过客户作用域，再返回。
-
-    ``customer_id`` 只在嵌套路由（``/customers/{cid}/contacts/{id}``）传入，用于
-    确认路径里的客户确实是这个联系人的父记录；对不上按"该客户下不存在此联系人"
-    处理（404），避免出现"用 A 客户的路径改到 B 客户的联系人"。
-    """
+def _get_owned_contact(db: Session, actor: User, contact_id: int) -> Contact:
+    """取一条可写联系人：先过客户作用域，再返回。"""
     contact = db.execute(
         select(Contact).where(Contact.id == contact_id, Contact.deleted_at.is_(None))
     ).scalar_one_or_none()
-    if contact is None or (
-        customer_id is not None and contact.customer_id != customer_id
-    ):
+    if contact is None:
         raise NotFoundError("联系人不存在")
     customer = get_customer(db, actor, contact.customer_id)
     assert_customer_writable(customer, actor)
@@ -152,10 +154,8 @@ def update_contact(
     actor: User,
     contact_id: int,
     payload: ContactUpdate,
-    *,
-    customer_id: int | None = None,
 ) -> Contact:
-    contact = _get_owned_contact(db, actor, contact_id, customer_id)
+    contact = _get_owned_contact(db, actor, contact_id)
     changes = payload.model_dump(exclude_unset=True)
     _validate_required(changes)
     if "decision_role" in changes:
@@ -166,15 +166,18 @@ def update_contact(
         _clear_other_primaries(db, contact.customer_id, keep_id=contact.id)
     for field, value in changes.items():
         setattr(contact, field, value)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # 同 create_contact：并发把两个联系人设成主联系人，后提交者在这里收口。
+        db.rollback()
+        raise ConflictError(_PRIMARY_CONFLICT_MESSAGE) from exc
     db.refresh(contact)
     return contact
 
 
-def delete_contact(
-    db: Session, actor: User, contact_id: int, *, customer_id: int | None = None
-) -> None:
+def delete_contact(db: Session, actor: User, contact_id: int) -> None:
     """软删除。已删除的再删一次是 404（不是幂等的 200，也不是 500）。"""
-    contact = _get_owned_contact(db, actor, contact_id, customer_id)
+    contact = _get_owned_contact(db, actor, contact_id)
     contact.deleted_at = datetime.now(UTC)
     db.commit()
