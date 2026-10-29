@@ -2,14 +2,15 @@
 
 读取一律从 :func:`app.db.scope.customer_query` 起步（design §2.3），写前一律
 :func:`app.db.scope.assert_customer_writable`；本模块只叠加业务过滤，不自拼
-``select(Customer)``。**只有两处故意绕过作用域**，结构审计时必须一起看：
+``select(Customer)``。**只有一处故意绕过作用域**：:func:`get_customer` 在作用域内
+查不到时做的存在性探针——只取 ``id`` 且限定未删除，用来把 403（有记录但无权）与
+404（记录不存在）分开。它不返回任何业务字段。
 
-1. :func:`find_similar_customers`：跨作用域重名软查重——别人建过、当前用户看不见
-   的同名客户也要命中，否则"看不见就查不出重复"，软查重等于没做；
-2. :func:`get_customer`：作用域内查不到时的存在性探针——只取 ``id`` 且限定未删除，
-   用来把 403（有记录但无权）与 404（记录不存在）分开。
+重名软查重（:func:`find_similar_customers`）**必须在调用者可见范围内**做：早期版本
+对 ``customers`` 全表取名字，等于把 409 的 ``detail.similar`` 变成了枚举全公司客户名
+的旁路（华南销售能拿到华东客户的名字，而直接 ``GET`` 那条客户是 403）。代价是跨部门
+重名不再提示——可见性优先于查重覆盖面，这是刻意取舍，不是遗漏。
 
-两处都不返回越权数据，但它们是 ``customer_query`` 之外仅有的读取入口。
 ``last_activity_at`` 的三条维护规则见 design §3.3。P1 还没有 activity 表，也没有
 领取/分配/转移接口（属后续阶段），所以这里只落"其余编辑一律不更新"这一半：
 创建不写该字段，编辑不碰它。
@@ -17,9 +18,10 @@
 
 import re
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, func, or_, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.errors import (
@@ -30,6 +32,12 @@ from app.core.errors import (
 )
 from app.core.text import LIKE_ESCAPE, contains_pattern
 from app.db.scope import assert_customer_writable, customer_query
+
+# 下面这行是**只读的过滤条件**（EXISTS 子查询），不是联系人数据的读取入口：联系人的
+# 可见性完全继承客户（见 contacts/service 顶部），而客户集合已经由 customer_query
+# 限定。反过来 import contacts.service 会形成 customers ↔ contacts 的循环依赖
+# （contacts.service 在模块顶层 import 本模块的 get_customer）。
+from app.modules.contacts.models import Contact
 from app.modules.customers.models import (
     BUDGET_STATUSES,
     CUSTOMER_LEVELS,
@@ -42,17 +50,27 @@ from app.modules.customers.schemas import (
     CustomerCreate,
     CustomerUpdate,
 )
-from app.modules.users.models import User
-from app.modules.users.service import (
+from app.modules.users.models import (
     ROLE_ADMIN,
     ROLE_MANAGER,
     ROLES,
     STATUS_ACTIVE,
-    get_user,
+    User,
 )
+from app.modules.users.service import get_user
 
 # 名称归一化时丢掉的噪声：空白、半/全角括号、书名号、间隔号、常见标点与斜杠
 _NOISE = re.compile(r"[\s（）()【】\[\]·,，.。\-—_/\\]")
+
+# 日期筛选的"一天"按 Asia/Shanghai 计算（design §5 时区约定）：库里是 timestamptz，
+# 用户传的是无时区的日期，只有以本地零点换算成带偏移的时刻才能对上"当天"。
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _day_start(day: date) -> datetime:
+    """把日期解释成 Asia/Shanghai 当天 00:00（带偏移的 aware datetime）。"""
+    return datetime(day.year, day.month, day.day, tzinfo=_SHANGHAI)
+
 
 _SORTABLE = {
     "name": Customer.name,
@@ -82,25 +100,26 @@ def normalize_name(name: str) -> str:
     return _NOISE.sub("", unicodedata.normalize("NFKC", name)).lower()
 
 
-def find_similar_customers(db: Session, name: str, limit: int = 5) -> list[Customer]:
-    """跨作用域的重名软查重（design §4.4）。
+def find_similar_customers(
+    db: Session, actor: User, name: str, limit: int = 5
+) -> list[Customer]:
+    """调用者可见范围内的重名软查重（design §4.4）。
 
-    这里**故意**不走 ``customer_query``：查重必须对全库生效——别人建过、当前用户
-    看不到的同名客户也要命中，否则"看不见就查不出重复"，软查重等于没做。已软删的
-    记录不参与，删掉再建同名是合法操作。
+    基础查询必须是 :func:`app.db.scope.customer_query`：409 响应体里的
+    ``detail.similar`` 会把命中的客户 ``id`` 与 ``name`` 回给调用方，若在作用域外
+    取数，这条查重通道就成了枚举全公司客户名的旁路（别人工号下的客户直接 ``GET``
+    是 403，这里却能读到名字）。因此只在调用者看得见的客户里判重——"看不见的名字
+    不提示重复"是可见性优先于查重覆盖面的刻意取舍。
 
+    已软删的记录不参与（``customer_query`` 已带过滤），删掉再建同名是合法操作。
     匹配分两档：归一化后完全相同优先，其次是互相包含（"XX 集团" vs "XX 集团分公司"
-    这类需要人工判断）。P1 数据量在万级以内，全表取名字在应用层比较即满足设计；
-    design §3.3 明确不建 ``lower(name)`` 函数索引。
+    这类需要人工判断）。P1 数据量在万级以内，取可见客户的名字在应用层比较即满足
+    设计；design §3.3 明确不建 ``lower(name)`` 函数索引。
     """
     target = normalize_name(name)
     if not target:
         return []
-    rows = (
-        db.execute(select(Customer).where(Customer.deleted_at.is_(None)))
-        .scalars()
-        .all()
-    )
+    rows = db.execute(customer_query(actor)).scalars().all()
     exact: list[Customer] = []
     fuzzy: list[Customer] = []
     for row in rows:
@@ -204,7 +223,7 @@ def create_customer(db: Session, actor: User, payload: CustomerCreate) -> Custom
         raise InvalidValueError("客户名称不能为空")
     _validate_enums(payload)
     if not payload.force:
-        similar = find_similar_customers(db, name)
+        similar = find_similar_customers(db, actor, name)
         if similar:
             raise ConflictError(
                 "客户名称疑似重复",
@@ -256,26 +275,53 @@ def list_customers(
     procurement_type: str | None = None,
     budget_status: str | None = None,
     owner_id: int | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
     page: int = 1,
     page_size: int = 20,
     sort: str = "-created_at",
 ) -> tuple[list[Customer], int]:
-    """作用域内的客户分页：返回当前页与总数（前端分页器要的是 total 不是本页数）。"""
+    """作用域内的客户分页：返回当前页与总数（前端分页器要的是 total 不是本页数）。
+
+    ``keyword`` 命中客户名/简称/编码，**或该客户下任一未删除联系人的姓名/电话**
+    （design §5；联系人与客户同属一条作用域，用 EXISTS 相关子查询，不做 join——
+    join 后同一客户会因多条匹配联系人重复出现，``total`` 与翻页都会跟着偏）。
+    ``date_from`` / ``date_to`` 筛的是 ``last_activity_at``（最后跟进时间区间），
+    按 Asia/Shanghai 的整天解释，且右端是**半开区间** ``< date_to + 1 天``：闭区间
+    会漏掉 ``date_to`` 当天下午的记录。``last_activity_at`` 为 NULL（从未跟进）的
+    客户在用了任一端日期筛选时都不会出现在结果里——SQL 比较对 NULL 结果为未知，
+    这是刻意的：从未跟进的客户不属于任何"最后跟进时间区间"。
+    """
     _validate_filter_enums(
         level=level,
         status=status,
         procurement_type=procurement_type,
         budget_status=budget_status,
     )
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise InvalidValueError("开始日期不能晚于结束日期")
     stmt: Select = customer_query(actor)
     if keyword and keyword.strip():
         # % 与 _ 按字面量匹配：搜索 "%" 不能变成"列出全部客户"
         pattern = contains_pattern(keyword.strip())
+        contact_match = (
+            select(Contact.id)
+            .where(
+                Contact.customer_id == Customer.id,
+                Contact.deleted_at.is_(None),
+                or_(
+                    Contact.name.ilike(pattern, escape=LIKE_ESCAPE),
+                    Contact.phone.ilike(pattern, escape=LIKE_ESCAPE),
+                ),
+            )
+            .exists()
+        )
         stmt = stmt.where(
             or_(
                 Customer.name.ilike(pattern, escape=LIKE_ESCAPE),
                 Customer.short_name.ilike(pattern, escape=LIKE_ESCAPE),
                 Customer.code.ilike(pattern, escape=LIKE_ESCAPE),
+                contact_match,
             )
         )
     if level:
@@ -288,6 +334,12 @@ def list_customers(
         stmt = stmt.where(Customer.budget_status == budget_status)
     if owner_id is not None:
         stmt = stmt.where(Customer.owner_id == owner_id)
+    if date_from is not None:
+        stmt = stmt.where(Customer.last_activity_at >= _day_start(date_from))
+    if date_to is not None:
+        stmt = stmt.where(
+            Customer.last_activity_at < _day_start(date_to + timedelta(days=1))
+        )
 
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
 
@@ -310,10 +362,9 @@ def list_customers(
 def get_customer(db: Session, actor: User, customer_id: int) -> Customer:
     """按作用域取单个客户：不存在 404，存在但无权限 403（design §5）。
 
-    作用域内查不到时，下面还有一个**裸 select 的存在性探针**——本模块两处故意
-    绕过 ``customer_query`` 的第二处（第一处是 :func:`find_similar_customers`）。
-    它只取 ``id``、限定 ``deleted_at IS NULL``，不返回任何业务字段；存在的意义是
-    把 403 与 404 分开，前端才能区分"没权限"与"记录没了"。
+    作用域内查不到时，下面还有一个**裸 select 的存在性探针**——本模块唯一一处故意
+    绕过 ``customer_query`` 的读取。它只取 ``id``、限定 ``deleted_at IS NULL``，不返回
+    任何业务字段；存在的意义是把 403 与 404 分开，前端才能区分"没权限"与"记录没了"。
     """
     customer = db.execute(
         customer_query(actor)
@@ -372,3 +423,31 @@ def delete_customer(db: Session, actor: User, customer_id: int) -> None:
     assert_customer_writable(customer, actor)
     customer.deleted_at = datetime.now(UTC)
     db.commit()
+
+
+def sync_customer_department(
+    db: Session, *, owner_id: int, department_id: int | None
+) -> int:
+    """把某用户名下客户的冗余 ``department_id`` 同步到新部门。
+
+    design §3.3 列的四个 ``department_id`` 同步点之一就是"所属销售调整部门"：客户
+    的可写范围按部门判定，销售调部门后若不同步，**旧主管仍能读写他的客户、新主管
+    却看不到**——违反 §2.2 的可见性规则。调用方是
+    :func:`app.modules.users.service.update_user`，必须在同一个事务里（本函数不
+    commit），否则会出现"用户已在新部门、客户还在旧部门"的中间态。
+
+    只写 ``department_id``：``owner_id`` 不动（归属没变）、``last_activity_at`` 不动
+    （§3.3 的三条维护规则里没有调整部门这一项）。已软删的客户跳过——它们对外不存在；
+    ``IS DISTINCT FROM`` 让部门本来就一致的客户不产生行级写入。返回实际受影响的行数，
+    供调用方记日志。
+    """
+    result = db.execute(
+        update(Customer)
+        .where(
+            Customer.owner_id == owner_id,
+            Customer.deleted_at.is_(None),
+            Customer.department_id.is_distinct_from(department_id),
+        )
+        .values(department_id=department_id)
+    )
+    return int(result.rowcount or 0)

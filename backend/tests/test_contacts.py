@@ -40,12 +40,8 @@ from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
-from app.modules.users.service import (
-    ROLE_ADMIN,
-    ROLE_MANAGER,
-    ROLE_SALES,
-    create_user,
-)
+from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
+from app.modules.users.service import create_user
 
 PASSWORD = "Passw0rd!"
 

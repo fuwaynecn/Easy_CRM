@@ -4,9 +4,15 @@ from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
 from app.core.errors import ForbiddenError, UnauthorizedError
-from app.core.security import decode_token
+from app.core.security import TOKEN_TYPE_ACCESS, decode_token
 from app.db.session import get_db
-from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLES, User
+from app.modules.users.models import (
+    ROLE_ADMIN,
+    ROLE_MANAGER,
+    ROLES,
+    STATUS_ACTIVE,
+    User,
+)
 
 
 def get_current_user(request: Request, db: Annotated[Session, Depends(get_db)]) -> User:
@@ -14,9 +20,9 @@ def get_current_user(request: Request, db: Annotated[Session, Depends(get_db)]) 
     scheme, _, token = header.partition(" ")
     if scheme.lower() != "bearer" or not token.strip():
         raise UnauthorizedError("未登录")
-    user_id = decode_token(token.strip(), "access")
+    user_id = decode_token(token.strip(), TOKEN_TYPE_ACCESS)
     user = db.get(User, user_id)
-    if user is None or user.status != "active":
+    if user is None or user.status != STATUS_ACTIVE:
         raise UnauthorizedError("账号不可用")
     # 角色只该来自 ROLES。数据库被手工改成 "guest" 之类时，作用域层虽然 fail-closed，
     # 但放它过鉴权会把"账号异常"伪装成"没有数据/没有权限"，排查时看不出根因。

@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Any
@@ -19,7 +20,6 @@ from app.core.security import DECOY_PASSWORD_HASH, hash_password, verify_passwor
 from app.core.text import LIKE_ESCAPE, contains_pattern
 from app.modules.departments.service import get_department
 from app.modules.users.models import (
-    ROLE_ADMIN,
     ROLE_MANAGER,
     ROLE_SALES,
     ROLES,
@@ -28,22 +28,7 @@ from app.modules.users.models import (
     User,
 )
 
-__all__ = [
-    "ROLES",
-    "ROLE_ADMIN",
-    "ROLE_MANAGER",
-    "ROLE_SALES",
-    "STATUS_ACTIVE",
-    "USER_STATUSES",
-    "authenticate",
-    "create_user",
-    "get_user",
-    "get_user_by_username",
-    "list_users",
-    "reset_password",
-    "set_user_status",
-    "update_user",
-]
+logger = logging.getLogger(__name__)
 
 # 用户不存在与口令错误必须给出完全相同的对外文案，避免账号存在性探测
 INVALID_CREDENTIALS_MESSAGE = "用户名或密码错误"
@@ -219,23 +204,16 @@ def authenticate(db: Session, username: str, password: str) -> User:
     return user
 
 
-def set_user_status(db: Session, user_id: int, status: str) -> User:
-    user = db.get(User, user_id)
-    if user is None:
-        raise NotFoundError("用户不存在")
-    _validate_status(status)
-    user.status = status
-    db.commit()
-    db.refresh(user)
-    return user
-
-
 def update_user(db: Session, user_id: int, changes: dict[str, Any]) -> User:
     """按"实际提交的字段"更新用户。
 
     用 dict 而不是一串可选关键字，是因为必须区分"没提交"与"显式置空"：
     department_id=null 是合法的清空动作，而 display_name / role / status 传 null
     一律视为未提交（这几列在库里是 NOT NULL）。
+
+    改部门时**必须在同一事务里同步该用户名下客户的冗余 ``department_id``**
+    （design §3.3 的第四个同步点）：客户的可见/可写范围按部门判定，不同步就会
+    "旧主管还能读写、新主管看不到"。部门没变化时不做任何客户写入。
     """
     user = db.get(User, user_id)
     if user is None:
@@ -262,6 +240,13 @@ def update_user(db: Session, user_id: int, changes: dict[str, Any]) -> User:
     final_department_id = changes.get("department_id", user.department_id)
     _require_department_for_role(final_role, final_department_id)
 
+    # 部门变更要同步名下客户，先记下旧值（下面赋值后就读不到了）：部门没变时
+    # 连一条 UPDATE 语句都不应该发出去。
+    old_department_id = user.department_id
+    department_changed = (
+        "department_id" in changes and changes["department_id"] != old_department_id
+    )
+
     if display_name is not None:
         user.display_name = cleaned_display_name
     if role is not None:
@@ -273,6 +258,24 @@ def update_user(db: Session, user_id: int, changes: dict[str, Any]) -> User:
     if status is not None:
         _validate_status(status)
         user.status = status
+
+    # 同步名下客户的冗余 department_id（design §3.3 第四个同步点）：与用户更新
+    # 同一个事务、同一个 commit，避免"人已在新部门、客户还挂在旧部门"的中间态。
+    if department_changed:
+        # 局部 import 破环：customers.service 在模块顶层 import 本模块的 get_user。
+        from app.modules.customers.service import sync_customer_department
+
+        affected = sync_customer_department(
+            db, owner_id=user.id, department_id=user.department_id
+        )
+        logger.info(
+            "用户部门变更，同步名下客户：user=%s old_department=%s "
+            "new_department=%s affected_customers=%d",
+            user.username,
+            old_department_id,
+            user.department_id,
+            affected,
+        )
 
     db.commit()
     db.refresh(user)

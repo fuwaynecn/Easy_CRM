@@ -7,7 +7,8 @@
 作用域按 owner 而非按部门；主管看得到本部门、看不到别的部门，说明按部门。
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -20,6 +21,8 @@ from app.core.errors import (
     InvalidValueError,
     NotFoundError,
 )
+from app.modules.contacts.schemas import ContactCreate
+from app.modules.contacts.service import create_contact, delete_contact
 from app.modules.customers.models import Customer
 from app.modules.customers.schemas import (
     CUSTOMER_CREATE_FIELDS,
@@ -30,19 +33,15 @@ from app.modules.customers.schemas import (
 from app.modules.customers.service import (
     create_customer,
     delete_customer,
+    find_similar_customers,
     get_customer,
     list_customers,
     normalize_name,
     update_customer,
 )
 from app.modules.departments.service import create_department
-from app.modules.users.service import (
-    ROLE_ADMIN,
-    ROLE_MANAGER,
-    ROLE_SALES,
-    create_user,
-    set_user_status,
-)
+from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
+from app.modules.users.service import create_user, update_user
 
 PASSWORD = "Passw0rd!"
 
@@ -308,7 +307,7 @@ def test_create_rejects_unknown_owner(db):
 
 def test_create_rejects_disabled_owner(db):
     f = _setup(db)
-    set_user_status(db, f["sa"].id, "disabled")
+    update_user(db, f["sa"].id, {"status": "disabled"})
 
     with pytest.raises(InvalidValueError) as exc:
         create_customer(
@@ -349,18 +348,34 @@ def test_create_customer_rejects_full_width_duplicate(db):
     assert [item["id"] for item in exc.value.detail["similar"]] == [existing.id]
 
 
-def test_duplicate_check_is_cross_scope(db):
-    """查重必须对全库生效：别的部门建过的同名客户我看不到，但创建时也要判重。"""
+def test_duplicate_check_only_sees_actors_scope(db):
+    """查重只在调用者可见的客户里做：看不见的名字不能被 409 回吐。
+
+    早期实现取 ``customers`` 全表比对，把 ``detail.similar`` 变成了枚举全公司客户名
+    的旁路：华南销售能看到华东客户的名字，而直接 ``GET`` 那条客户是 403。
+    """
     f = _setup(db)
     hidden = create_customer(db, f["sb"], CustomerCreate(name="浙江甲制造有限公司"))
     # 销售A 的作用域里确实没有这条
     items, total = list_customers(db, f["sa"])
     assert total == 0 and items == []
 
+    created = create_customer(db, f["sa"], CustomerCreate(name="浙江甲制造有限公司"))
+
+    assert created.id != hidden.id
+    visible = find_similar_customers(db, f["sa"], "浙江甲制造有限公司")
+    assert [c.id for c in visible] == [created.id]
+
+
+def test_duplicate_check_includes_public_pool(db):
+    """公海客户对所有角色可见，同名创建仍然要提示重复。"""
+    f = _setup(db)
+    pool = create_customer(db, f["admin"], CustomerCreate(name="浙江甲制造有限公司"))
+
     with pytest.raises(ConflictError) as exc:
         create_customer(db, f["sa"], CustomerCreate(name="浙江甲制造有限公司"))
 
-    assert [item["id"] for item in exc.value.detail["similar"]] == [hidden.id]
+    assert [item["id"] for item in exc.value.detail["similar"]] == [pool.id]
 
 
 def test_duplicate_check_caps_similar_at_five(db):
@@ -471,6 +486,142 @@ def test_update_whitelist_forbids_owner_id():
     assert "owner_id" not in CUSTOMER_UPDATE_FIELDS
     with pytest.raises(ValidationError):
         CustomerUpdate(owner_id=7)
+
+def test_list_customers_keyword_matches_contact_name_and_phone(db):
+    """spec §5:396：keyword 也要命中联系人姓名与电话（客户列表是唯一的搜索入口）。"""
+    f = _setup(db)
+    customer = create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+    create_contact(
+        db, f["sa"], customer.id, ContactCreate(name="王小明", phone="13800138000")
+    )
+    create_customer(db, f["sa"], CustomerCreate(name="乙公司", force=True))
+
+    by_name, total_name = list_customers(db, f["sa"], keyword="王小明")
+    assert total_name == 1 and [c.id for c in by_name] == [customer.id]
+
+    by_phone, total_phone = list_customers(db, f["sa"], keyword="13800138000")
+    assert total_phone == 1 and [c.id for c in by_phone] == [customer.id]
+
+    by_fragment, total_fragment = list_customers(db, f["sa"], keyword="1380013")
+    assert total_fragment == 1 and [c.id for c in by_fragment] == [customer.id]
+
+
+def test_list_customers_keyword_ignores_soft_deleted_contacts(db):
+    f = _setup(db)
+    customer = create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+    gone = create_contact(db, f["sa"], customer.id, ContactCreate(name="王小明"))
+    delete_contact(db, f["sa"], gone.id)
+
+    items, total = list_customers(db, f["sa"], keyword="王小明")
+
+    assert total == 0 and items == []
+
+
+def test_list_customers_keyword_contact_matches_do_not_duplicate_rows(db):
+    """EXISTS 而不是 join：同一客户两条联系人都命中时只能出现一行，total 也不能翻倍。"""
+    f = _setup(db)
+    customer = create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+    create_contact(db, f["sa"], customer.id, ContactCreate(name="王小明"))
+    create_contact(db, f["sa"], customer.id, ContactCreate(name="王小华"))
+    other = create_customer(db, f["sb"], CustomerCreate(name="乙公司"))
+    create_contact(db, f["sb"], other.id, ContactCreate(name="王小明"))
+
+    items, total = list_customers(db, f["sa"], keyword="王")
+
+    assert total == 1
+    assert [c.id for c in items] == [customer.id]
+
+
+# --- 列表：最后跟进时间区间（spec §5:396） ------------------------------
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _customer_followed_up(db, actor, name: str, moment: datetime):
+    customer = create_customer(db, actor, CustomerCreate(name=name))
+    customer.last_activity_at = moment
+    db.commit()
+    return customer
+
+
+def test_list_customers_date_from_is_inclusive(db):
+    f = _setup(db)
+    target = _customer_followed_up(
+        db, f["sa"], "甲公司", datetime(2026, 3, 10, 0, 0, tzinfo=SHANGHAI)
+    )
+    _customer_followed_up(
+        db, f["sa"], "乙公司", datetime(2026, 3, 9, 23, 59, tzinfo=SHANGHAI)
+    )
+
+    items, total = list_customers(db, f["sa"], date_from=date(2026, 3, 10))
+
+    assert total == 1 and [c.id for c in items] == [target.id]
+
+
+def test_list_customers_date_to_includes_the_whole_day(db):
+    """右端是半开区间：``date_to`` 当天下午的记录必须还在（闭区间会漏掉）。"""
+    f = _setup(db)
+    afternoon = _customer_followed_up(
+        db, f["sa"], "甲公司", datetime(2026, 3, 10, 15, 30, tzinfo=SHANGHAI)
+    )
+    next_day = _customer_followed_up(
+        db, f["sa"], "乙公司", datetime(2026, 3, 11, 0, 0, tzinfo=SHANGHAI)
+    )
+
+    items, total = list_customers(db, f["sa"], date_to=date(2026, 3, 10))
+
+    assert total == 1 and [c.id for c in items] == [afternoon.id]
+    assert next_day.id not in {c.id for c in items}
+
+
+def test_list_customers_date_range_combined(db):
+    f = _setup(db)
+    inside = _customer_followed_up(
+        db, f["sa"], "甲公司", datetime(2026, 3, 10, 15, 30, tzinfo=SHANGHAI)
+    )
+    _customer_followed_up(
+        db, f["sa"], "乙公司", datetime(2026, 3, 12, 0, 0, tzinfo=SHANGHAI)
+    )
+
+    items, total = list_customers(
+        db, f["sa"], date_from=date(2026, 3, 10), date_to=date(2026, 3, 10)
+    )
+
+    assert total == 1 and [c.id for c in items] == [inside.id]
+
+
+def test_list_customers_rejects_reversed_date_range(db):
+    f = _setup(db)
+
+    with pytest.raises(InvalidValueError) as exc:
+        list_customers(
+            db, f["sa"], date_from=date(2026, 3, 11), date_to=date(2026, 3, 10)
+        )
+
+    assert exc.value.status_code == 400
+
+
+def test_list_customers_date_filter_excludes_never_followed_up(db):
+    """``last_activity_at`` 为 NULL 的客户在用了任一端日期筛选时都不出现。"""
+    f = _setup(db)
+    followed = _customer_followed_up(
+        db, f["sa"], "甲公司", datetime(2026, 3, 10, 15, 30, tzinfo=SHANGHAI)
+    )
+    never = create_customer(db, f["sa"], CustomerCreate(name="乙公司", force=True))
+    assert never.last_activity_at is None
+
+    only_from, total_from = list_customers(
+        db, f["sa"], date_from=date(2000, 1, 1)
+    )
+    assert total_from == 1 and [c.id for c in only_from] == [followed.id]
+
+    only_to, total_to = list_customers(db, f["sa"], date_to=date(2100, 1, 1))
+    assert total_to == 1 and [c.id for c in only_to] == [followed.id]
+
+    _all_items, total_without_dates = list_customers(db, f["sa"])
+    assert total_without_dates == 2
+
 
 # --- 列表：作用域、筛选、排序、分页 -------------------------------------
 
@@ -971,6 +1122,129 @@ def test_api_create_conflict_then_force(client, db):
     assert forced.status_code == 201, forced.text
 
 
+def test_api_duplicate_check_still_finds_own_customer(client, db):
+    """可见范围内（自己名下，同一个部门）的同名客户仍然 409，查重照常生效。"""
+    _setup(db)
+    headers = _auth(_token(client, "sales_a"))
+    first = client.post(
+        "/api/v1/customers", headers=headers, json={"name": "浙江甲制造有限公司"}
+    )
+    assert first.status_code == 201, first.text
+
+    dup = client.post(
+        "/api/v1/customers", headers=headers, json={"name": "浙江甲制造有限公司"}
+    )
+
+    assert dup.status_code == 409
+    assert dup.json()["detail"]["similar"] == [
+        {"id": first.json()["id"], "name": "浙江甲制造有限公司"}
+    ]
+
+
+def test_api_duplicate_check_still_finds_public_pool(client, db):
+    """公海客户对所有人可见，同名创建仍然 409。"""
+    f = _setup(db)
+    pool = create_customer(db, f["admin"], CustomerCreate(name="浙江甲制造有限公司"))
+
+    resp = client.post(
+        "/api/v1/customers",
+        headers=_auth(_token(client, "sales_a")),
+        json={"name": "浙江甲制造有限公司"},
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert [item["id"] for item in resp.json()["detail"]["similar"]] == [pool.id]
+
+
+def test_api_duplicate_check_includes_manager_department_scope(client, db):
+    """主管可见本部门全部客户，因此下属的同名客户必须仍被查出来。
+
+    §2.2 只给 ``sales`` 自己名下（+ 公海）的可见范围，同部门同事的客户对销售仍是
+    403；"同部门可见"成立的是 ``manager``。这条盯住部门可见范围内的查重不能因为
+    收紧作用域而一起失效。
+    """
+    f = _setup(db)
+    colleague = create_customer(db, f["sc"], CustomerCreate(name="浙江甲制造有限公司"))
+
+    resp = client.post(
+        "/api/v1/customers",
+        headers=_auth(_token(client, "boss")),
+        json={"name": "浙江甲制造有限公司"},
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert [item["id"] for item in resp.json()["detail"]["similar"]] == [colleague.id]
+
+
+def test_api_duplicate_check_cross_department_creates_and_does_not_leak(client, db):
+    """跨部门同名：201，响应里不能出现别部门客户（查重越权泄漏的回归点）。
+
+    旧实现在全表查重，这条会 409 并把华南客户的名字回给华东销售——而那条客户
+    他直接 GET 是 403。收紧到可见范围后跨部门重名不再提示，这是有意的取舍。
+    """
+    f = _setup(db)
+    hidden = create_customer(db, f["sb"], CustomerCreate(name="浙江甲制造有限公司"))
+
+    resp = client.post(
+        "/api/v1/customers",
+        headers=_auth(_token(client, "sales_a")),
+        json={"name": "浙江甲制造有限公司"},
+    )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["id"] != hidden.id
+    # 201 体里没有任何 similar/detail 结构，也不含别部门的客户 id
+    assert "similar" not in resp.text
+    assert "detail" not in body
+
+
+def test_api_duplicate_check_does_not_leak_fuzzy_match_name(client, db):
+    """互相包含的模糊命中同样不能泄漏：别部门的"浙江甲制造有限公司"不能出现在响应里。"""
+    f = _setup(db)
+    create_customer(db, f["sb"], CustomerCreate(name="浙江甲制造有限公司"))
+
+    resp = client.post(
+        "/api/v1/customers",
+        headers=_auth(_token(client, "sales_a")),
+        json={"name": "浙江甲制造"},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert "浙江甲制造有限公司" not in resp.text
+
+
+def test_api_duplicate_similar_ids_are_all_readable_by_caller(client, db):
+    """``detail.similar`` 里每条 id，调用者都必须 GET 到 200。
+
+    这条是防未来回归的关键：只要查重再次套错作用域，similar 里就会出现调用者
+    读不到的客户，循环里的 GET 立刻从 200 变成 403。
+    """
+    f = _setup(db)
+    own = create_customer(db, f["sa"], CustomerCreate(name="浙江甲制造有限公司"))
+    pool = create_customer(
+        db,
+        f["admin"],
+        CustomerCreate(name="浙江甲制造有限公司（宁波）", force=True),
+    )
+    hidden = create_customer(
+        db, f["sb"], CustomerCreate(name="浙江甲制造有限公司嘉兴", force=True)
+    )
+    headers = _auth(_token(client, "sales_a"))
+
+    resp = client.post(
+        "/api/v1/customers", headers=headers, json={"name": "浙江甲制造有限公司"}
+    )
+
+    assert resp.status_code == 409, resp.text
+    similar = resp.json()["detail"]["similar"]
+    assert {item["id"] for item in similar} == {own.id, pool.id}
+    assert hidden.id not in {item["id"] for item in similar}
+    for item in similar:
+        detail = client.get(f"/api/v1/customers/{item['id']}", headers=headers)
+        assert detail.status_code == 200, (item, detail.text)
+
+
 def test_api_create_sets_owner_and_hides_internal_fields(client, db):
     f = _setup(db)
 
@@ -1114,6 +1388,31 @@ def test_api_list_pagination_and_keyword(client, db):
     ).json()
     assert percent["total"] == 1
     assert [item["name"] for item in percent["items"]] == ["100%控股公司"]
+
+
+def test_api_list_filters_by_activity_date_range(client, db):
+    """日期区间参数在 HTTP 上可用：当天下午的记录不能漏，反向区间是 400。"""
+    f = _setup(db)
+    inside = _customer_followed_up(
+        db, f["sa"], "甲公司", datetime(2026, 3, 10, 15, 30, tzinfo=SHANGHAI)
+    )
+    headers = _auth(_token(client, "sales_a"))
+
+    body = client.get(
+        "/api/v1/customers",
+        headers=headers,
+        params={"date_from": "2026-03-10", "date_to": "2026-03-10"},
+    ).json()
+    assert body["total"] == 1
+    assert [item["id"] for item in body["items"]] == [inside.id]
+
+    reversed_range = client.get(
+        "/api/v1/customers",
+        headers=headers,
+        params={"date_from": "2026-03-11", "date_to": "2026-03-10"},
+    )
+    assert reversed_range.status_code == 400
+    assert reversed_range.json()["code"] == "invalid_value"
 
 
 @pytest.mark.parametrize(

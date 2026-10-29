@@ -4,15 +4,19 @@
 避免"service 层测过了、路由接线错了"这类静默失败。
 """
 
+import logging
+from datetime import UTC, datetime
+
 import pytest
+from sqlalchemy import event
 
 from app.core.security import verify_password
+from app.modules.customers.models import Customer
+from app.modules.customers.schemas import CustomerCreate
+from app.modules.customers.service import create_customer, delete_customer
 from app.modules.departments.service import create_department
-from app.modules.users.models import User
+from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
 from app.modules.users.service import (
-    ROLE_ADMIN,
-    ROLE_MANAGER,
-    ROLE_SALES,
     create_user,
     get_user_by_username,
 )
@@ -866,3 +870,132 @@ def test_non_admin_gets_403_with_unified_error_body(
     assert victim.status == "active"
     assert verify_password(PASSWORD, victim.password_hash)
     assert get_user_by_username(db, "sneaky") is None
+
+
+# --- 改部门时同步名下客户（spec §3.3:122 第四个同步点） ------------------
+
+
+def _two_department_fixture(db) -> dict:
+    """华东/华南各一个主管，一个华东销售；管理员无部门。"""
+    east = create_department(db, "华东销售部")
+    west = create_department(db, "华南销售部")
+    admin = create_user(
+        db,
+        username="admin",
+        password=PASSWORD,
+        display_name="管理员",
+        role=ROLE_ADMIN,
+        department_id=None,
+    )
+    boss_east = create_user(
+        db,
+        username="boss_east",
+        password=PASSWORD,
+        display_name="东区主管",
+        role=ROLE_MANAGER,
+        department_id=east.id,
+    )
+    boss_west = create_user(
+        db,
+        username="boss_west",
+        password=PASSWORD,
+        display_name="南区主管",
+        role=ROLE_MANAGER,
+        department_id=west.id,
+    )
+    sales = create_user(
+        db,
+        username="sales1",
+        password=PASSWORD,
+        display_name="销售一",
+        role=ROLE_SALES,
+        department_id=east.id,
+    )
+    return {
+        "admin": admin,
+        "boss_east": boss_east,
+        "boss_west": boss_west,
+        "sales": sales,
+        "east": east,
+        "west": west,
+    }
+
+
+def test_department_change_syncs_owned_customers_and_scope(client, db, caplog):
+    """销售调部门后：客户 department_id 跟着变，旧主管看不到、新主管看得到。"""
+    f = _two_department_fixture(db)
+    customer = create_customer(db, f["sales"], CustomerCreate(name="甲公司"))
+    other = create_customer(db, f["sales"], CustomerCreate(name="乙公司", force=True))
+    historical = datetime(2026, 1, 1, tzinfo=UTC)
+    customer.last_activity_at = historical
+    db.commit()
+    gone = create_customer(db, f["sales"], CustomerCreate(name="丙公司", force=True))
+    delete_customer(db, f["admin"], gone.id)
+
+    headers = _auth(_token(client, "admin"))
+    with caplog.at_level(logging.INFO):
+        resp = client.patch(
+            f"/api/v1/users/{f['sales'].id}",
+            headers=headers,
+            json={"department_id": f["west"].id},
+        )
+    assert resp.status_code == 200, resp.text
+
+    db.expire_all()
+    moved = db.get(Customer, customer.id)
+    assert moved is not None
+    assert moved.department_id == f["west"].id
+    # owner 与最后跟进时间都不能被这次同步动到
+    assert moved.owner_id == f["sales"].id
+    assert moved.last_activity_at == historical
+    assert db.get(Customer, other.id).department_id == f["west"].id
+    # 已软删的客户跳过：它对外不存在，恢复时由一致性检查任务兜底
+    assert db.get(Customer, gone.id).department_id == f["east"].id
+
+    # 真实作用域断言：旧主管彻底看不到，新主管能看到并读详情
+    east_headers = _auth(_token(client, "boss_east"))
+    west_headers = _auth(_token(client, "boss_west"))
+    assert (
+        client.get(f"/api/v1/customers/{customer.id}", headers=east_headers).status_code
+        == 403
+    )
+    assert (
+        client.get(f"/api/v1/customers/{customer.id}", headers=west_headers).status_code
+        == 200
+    )
+    east_list = client.get("/api/v1/customers", headers=east_headers).json()
+    west_list = client.get("/api/v1/customers", headers=west_headers).json()
+    assert east_list["total"] == 0
+    assert {item["id"] for item in west_list["items"]} == {customer.id, other.id}
+
+    # 日志：用户名、旧/新部门、影响客户数；不得出现口令或哈希
+    assert "sales1" in caplog.text
+    assert f"old_department={f['east'].id}" in caplog.text
+    assert f"new_department={f['west'].id}" in caplog.text
+    assert "affected_customers=2" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
+def test_unchanged_department_does_not_write_customers(client, db):
+    """部门没变时一条 UPDATE customers 都不应发出（避免无谓写入）。"""
+    f = _two_department_fixture(db)
+    create_customer(db, f["sales"], CustomerCreate(name="甲公司"))
+    updates: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE CUSTOMERS"):
+            updates.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        resp = client.patch(
+            f"/api/v1/users/{f['sales'].id}",
+            headers=_auth(_token(client, "admin")),
+            json={"department_id": f["east"].id},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert resp.status_code == 200, resp.text
+    assert updates == []

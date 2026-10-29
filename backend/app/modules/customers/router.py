@@ -5,6 +5,7 @@
 换一个入口（导入、报表）就会漏。
 """
 
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Response
@@ -40,6 +41,8 @@ def get_customers(
     procurement_type: str | None = None,
     budget_status: str | None = None,
     owner_id: int | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
     sort: str = "-created_at",
 ):
     items, total = list_customers(
@@ -51,6 +54,8 @@ def get_customers(
         procurement_type=procurement_type,
         budget_status=budget_status,
         owner_id=owner_id,
+        date_from=date_from,
+        date_to=date_to,
         page=page.page,
         page_size=page.page_size,
         sort=sort,

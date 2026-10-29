@@ -48,6 +48,8 @@
 | `manager` | `department_id = 自己部门` 的记录；公海客户只读 | 本部门全部 |
 | `admin` | 全部 | 全部 |
 
+除上表外还有一条实现口径：`sales` 可以编辑自己名下的客户，但**删除仅限 `manager` / `admin`**。
+
 公海客户（`owner_id IS NULL`）对 `sales` 与 `manager` 均为**只读**，领取后才可编辑。这条是硬约束，防止销售之间互相改写他人池中的客户。
 
 ### 2.3 权限的结构性保证
@@ -344,6 +346,8 @@ AND 满足 4.1 的另外两条豁免条件
 - **分配**（`manager` 本部门 / `admin` 全部）：指定目标销售，不重置 `last_activity_at`，未关闭机会同步转移，写日志。目标销售需为 `active` 状态且仍有配额。
 - **释放**（主动放回公海）：仅 `manager` / `admin` 可操作，或原负责人在有转岗/离职场景下由管理员代为操作。
 
+**P1 没有领取功能。** 因此 `admin` 创建且未指定负责人的客户会落在公海：`admin` 可以编辑这些客户，`sales` / `manager` 只能只读；P2 上线领取后，这些客户可被正常领取。
+
 ### 4.4 客户重名处理
 
 创建客户时，后端将输入名称归一化（**先做 NFKC 全角转半角**，再去空格、去“（）”等噪声字符、转小写）后做模糊匹配，命中则返回 409，body 内含相似客户列表（最多 5 条）。前端弹窗展示“可能重复”，用户确认后带 `force=true` 重新提交。
@@ -394,6 +398,7 @@ AND 满足 4.1 的另外两条豁免条件
 - 分页：`?page=1&page_size=20`，响应 `{items, total, page, page_size}`。`page_size` 上限 200。
 - 例外：`GET /api/v1/customers/{cid}/contacts` **不分页**（一个客户的联系人量级很小），直接返回数组，与其它列表的 `{items, total}` 约定不同。
 - 列表筛选通用参数：`keyword`（名称/联系人/电话模糊匹配）、`owner_id`、`status`、`procurement_type`、`budget_status`、`stage`、`level`、日期区间 `date_from` / `date_to`、`sort`（白名单字段 + `-` 前缀表倒序）。
+  - `keyword` 在 P1 只对客户字段（名称、简称、编码）以及**该客户下未删除联系人的姓名/电话**生效；机会、待办相关字段的搜索留给后续阶段。
 - 认证：access token 存前端内存（2 小时），refresh token 用 `httpOnly` + `Secure` + `SameSite=Lax` cookie（7 天）。不使用 localStorage 存 token。页面刷新或 access token 过期时，前端用 refresh cookie 静默换取新 access token；refresh 失败则跳登录页。
 - 时区：数据库与接口一律 UTC（ISO 8601 带偏移），前端按 `Asia/Shanghai` 展示，“今天”的判断在后端统一用该时区。
 - 越权返回 403 而非 404（内部系统，明确告诉用户没权限比假装不存在更利于排障）。

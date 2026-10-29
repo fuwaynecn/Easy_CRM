@@ -14,14 +14,14 @@ from app.core.errors import (
 )
 from app.core.security import hash_password, verify_password
 from app.modules.departments.service import create_department
+from app.modules.users.models import ROLE_SALES
 from app.modules.users.schemas import PasswordReset, UserCreate
 from app.modules.users.service import (
-    ROLE_SALES,
     authenticate,
     create_user,
     get_user_by_username,
     reset_password,
-    set_user_status,
+    update_user,
 )
 
 
@@ -303,7 +303,7 @@ def test_disabled_user_cannot_authenticate(db):
         role=ROLE_SALES,
         department_id=dept.id,
     )
-    set_user_status(db, user.id, "disabled")
+    update_user(db, user.id, {"status": "disabled"})
     with pytest.raises(ForbiddenError) as excinfo:
         authenticate(db, "zhangsan", "Passw0rd!")
     assert excinfo.value.status_code == 403

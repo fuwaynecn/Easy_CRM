@@ -8,12 +8,10 @@ from app.core import security
 from app.core.config import settings
 from app.modules.auth.schemas import LoginRequest
 from app.modules.departments.service import create_department
+from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import (
-    ROLE_ADMIN,
-    ROLE_MANAGER,
-    ROLE_SALES,
     create_user,
-    set_user_status,
+    update_user,
 )
 
 
@@ -131,7 +129,7 @@ def test_unknown_user_looks_identical_to_wrong_password(client, db):
 
 def test_disabled_user_login_returns_403(client, db):
     user = _make_user(db)
-    set_user_status(db, user.id, "disabled")
+    update_user(db, user.id, {"status": "disabled"})
     resp = _login(client)
     assert resp.status_code == 403
     assert resp.json()["code"] == "forbidden"
@@ -272,7 +270,7 @@ def test_refresh_failure_clears_refresh_cookie(client, db):
 def test_disabled_user_refresh_is_rejected(client, db):
     user = _make_user(db)
     refresh = _refresh_cookie_value(_login(client))
-    set_user_status(db, user.id, "disabled")
+    update_user(db, user.id, {"status": "disabled"})
     _use_refresh_cookie(client, refresh)
     resp = client.post("/api/v1/auth/refresh")
     assert resp.status_code == 401
@@ -302,7 +300,7 @@ def test_logout_clears_refresh_cookie(client, db):
 def test_disabled_user_token_is_rejected(client, db):
     user = _make_user(db)
     token = _login(client).json()["access_token"]
-    set_user_status(db, user.id, "disabled")
+    update_user(db, user.id, {"status": "disabled"})
     resp = client.get("/api/v1/me", headers=_bearer(token))
     assert resp.status_code == 401
 

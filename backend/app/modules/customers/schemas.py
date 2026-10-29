@@ -57,11 +57,6 @@ CUSTOMER_CREATE_FIELDS = frozenset(CustomerCreate.model_fields)
 CUSTOMER_UPDATE_FIELDS = frozenset(CustomerUpdate.model_fields)
 
 
-class CustomerOwnerUpdate(BaseModel):
-    owner_id: int | None = None
-    reason: str | None = None
-
-
 class CustomerRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -110,10 +105,3 @@ class CustomerRead(BaseModel):
         }
         values["owner_name"] = owner.display_name if owner is not None else None
         return values
-
-
-class CustomerBrief(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    name: str

@@ -7,7 +7,7 @@ from app.core.security import (
     create_refresh_token,
     decode_token,
 )
-from app.modules.users.models import User
+from app.modules.users.models import STATUS_ACTIVE, User
 from app.modules.users.service import authenticate
 
 
@@ -22,7 +22,7 @@ def login(db: Session, username: str, password: str) -> tuple[User, str, str, in
 def refresh_access(db: Session, refresh_token: str) -> tuple[User, str, int]:
     user_id = decode_token(refresh_token, TOKEN_TYPE_REFRESH)
     user = db.get(User, user_id)
-    if user is None or user.status != "active":
+    if user is None or user.status != STATUS_ACTIVE:
         raise UnauthorizedError("账号不可用")
     access, expires_in = create_access_token(user.id)
     return user, access, expires_in
