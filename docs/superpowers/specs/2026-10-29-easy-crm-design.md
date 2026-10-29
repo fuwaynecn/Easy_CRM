@@ -132,12 +132,14 @@ PostgreSQL 16，字符集 UTF-8。所有表带 `created_at`、`updated_at`（UTC
 | phone | varchar(32) | |
 | wechat | varchar(64) | |
 | email | varchar(128) | |
-| is_primary | boolean default false | 主要联系人 |
+| is_primary | boolean not null default false（数据库默认值） | 主要联系人 |
 | decision_role | varchar(32) | 决策人 / 技术负责人 / 采购 / 使用者 / 其他 |
 | remark | text | |
 
 索引：`(customer_id)`、`(phone)`。
 同一客户下允许手机号重复输入（不做唯一约束），仅在 UI 提示“该客户下已有此号码的联系人”。
+
+主联系人**至多一条、可以为 0**（新客户可以没有主联系人）；切换主联系人时服务层把旧的置 false，数据库再用部分唯一索引 `uq_contacts_customer_primary`（谓词含 `deleted_at IS NULL`）兜底。删除主联系人**不自动补位**，下次由用户显式指定。
 
 ### 3.5 opportunities
 
@@ -388,6 +390,7 @@ AND 满足 4.1 的另外两条豁免条件
 - 前缀 `/api/v1`，REST，资源名复数。
 - 成功直接返回资源或分页体；错误统一 `{code, message, detail}`。
 - 分页：`?page=1&page_size=20`，响应 `{items, total, page, page_size}`。`page_size` 上限 200。
+- 例外：`GET /api/v1/customers/{cid}/contacts` **不分页**（一个客户的联系人量级很小），直接返回数组，与其它列表的 `{items, total}` 约定不同。
 - 列表筛选通用参数：`keyword`（名称/联系人/电话模糊匹配）、`owner_id`、`status`、`procurement_type`、`budget_status`、`stage`、`level`、日期区间 `date_from` / `date_to`、`sort`（白名单字段 + `-` 前缀表倒序）。
 - 认证：access token 存前端内存（2 小时），refresh token 用 `httpOnly` + `Secure` + `SameSite=Lax` cookie（7 天）。不使用 localStorage 存 token。页面刷新或 access token 过期时，前端用 refresh cookie 静默换取新 access token；refresh 失败则跳登录页。
 - 时区：数据库与接口一律 UTC（ISO 8601 带偏移），前端按 `Asia/Shanghai` 展示，“今天”的判断在后端统一用该时区。

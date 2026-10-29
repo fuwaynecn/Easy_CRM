@@ -20,7 +20,12 @@ from app.core.errors import (
     NotFoundError,
 )
 from app.modules.customers.models import Customer
-from app.modules.customers.schemas import CustomerCreate, CustomerUpdate
+from app.modules.customers.schemas import (
+    CUSTOMER_CREATE_FIELDS,
+    CUSTOMER_UPDATE_FIELDS,
+    CustomerCreate,
+    CustomerUpdate,
+)
 from app.modules.customers.service import (
     create_customer,
     delete_customer,
@@ -391,6 +396,23 @@ def test_create_customer_with_force_skips_duplicate_check(db):
     assert dup.id is not None
 
 
+def test_force_only_applies_to_the_current_request(db):
+    """``force`` 是单次请求的开关，不是客户名上的持久豁免。
+
+    第一次带 force 建成功后，紧接着同名再建（不带 force）必须仍然 409；
+    否则重名软查重会被一次 force 永久绕过。
+    """
+    f = _setup(db)
+    create_customer(
+        db, f["sa"], CustomerCreate(name="浙江甲制造有限公司", force=True)
+    )
+
+    with pytest.raises(ConflictError) as exc:
+        create_customer(db, f["sa"], CustomerCreate(name="浙江甲制造有限公司"))
+
+    assert exc.value.status_code == 409
+
+
 def test_create_strips_name_and_rejects_blank(db):
     f = _setup(db)
 
@@ -427,15 +449,27 @@ def test_create_customer_validates_enums(db, payload):
 
 
 @pytest.mark.parametrize(
-    "field", ["owner_id", "department_id", "last_activity_at", "created_by", "deleted_at"]
+    "field", ["department_id", "last_activity_at", "created_by", "deleted_at"]
 )
 def test_schemas_reject_internal_fields(field):
-    """内部字段不能从请求体写进来：owner 变更走领取/分配，冗余字段由后端同步。"""
+    """内部字段不能从请求体写进来：冗余字段与审计字段由后端同步。"""
     with pytest.raises(ValidationError):
         CustomerUpdate(**{field: 1})
-    if field != "owner_id":
-        with pytest.raises(ValidationError):
-            CustomerCreate(name="甲公司", **{field: 1})
+    with pytest.raises(ValidationError):
+        CustomerCreate(name="甲公司", **{field: 1})
+
+
+def test_create_whitelist_allows_owner_id():
+    """创建可传 owner_id：管理员/主管建客户时直接指定负责人（由 service 校验范围）。"""
+    assert "owner_id" in CUSTOMER_CREATE_FIELDS
+    assert CustomerCreate(name="甲公司", owner_id=7).owner_id == 7
+
+
+def test_update_whitelist_forbids_owner_id():
+    """更新不可传 owner_id：转移客户要写 owner_change_logs、走专门流程（§4.3）。"""
+    assert "owner_id" not in CUSTOMER_UPDATE_FIELDS
+    with pytest.raises(ValidationError):
+        CustomerUpdate(owner_id=7)
 
 # --- 列表：作用域、筛选、排序、分页 -------------------------------------
 
@@ -529,6 +563,23 @@ def test_list_customers_sorts_newest_first_and_rejects_unknown_field(db):
     with pytest.raises(InvalidValueError) as exc:
         list_customers(db, f["sa"], sort="deleted_at")
     assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "sort",
+    ["name;DROP TABLE customers", "name,id", "-name,unknown"],
+    ids=["semicolon", "comma", "multi-field"],
+)
+def test_list_customers_rejects_sort_injection_forms(db, sort):
+    """sort 只接受白名单里的单字段（可带 ``-`` 前缀）；其余形态 400 且不动表。"""
+    f = _setup(db)
+    create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+
+    with pytest.raises(InvalidValueError) as exc:
+        list_customers(db, f["sa"], sort=sort)
+
+    assert exc.value.status_code == 400
+    assert db.execute(text("SELECT count(*) FROM customers")).scalar_one() == 1
 
 
 def test_list_customers_excludes_soft_deleted(db):
@@ -677,6 +728,43 @@ def test_delete_is_soft_and_sales_cannot_delete(db):
     assert customer.deleted_at is not None
     items, total = list_customers(db, f["boss"])
     assert total == 0 and items == []
+
+
+def test_manager_cannot_delete_pool_customer(db):
+    """公海客户连主管也不能删：可读不等于可写。"""
+    f = _setup(db)
+    pool = create_customer(db, f["admin"], CustomerCreate(name="公海公司"))
+
+    with pytest.raises(ForbiddenError) as exc:
+        delete_customer(db, f["boss"], pool.id)
+
+    assert exc.value.status_code == 403
+    db.refresh(pool)
+    assert pool.deleted_at is None
+
+
+def test_sales_from_other_department_cannot_delete_customer(db):
+    """跨部门销售删除 403：删除仅限主管及以上，先撞角色守卫。"""
+    f = _setup(db)
+    customer = create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+
+    with pytest.raises(ForbiddenError) as exc:
+        delete_customer(db, f["sb"], customer.id)
+
+    assert exc.value.status_code == 403
+    db.refresh(customer)
+    assert customer.deleted_at is None
+
+
+def test_manager_can_delete_customer_in_own_department(db):
+    """本部门（自己管辖范围内）的客户可删。"""
+    f = _setup(db)
+    customer = create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+
+    delete_customer(db, f["boss"], customer.id)
+
+    db.expire_all()
+    assert db.get(Customer, customer.id).deleted_at is not None
 
 
 def test_delete_missing_customer_returns_not_found(db):

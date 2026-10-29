@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.deps import CurrentUser
 from app.core.errors import ForbiddenError, NotFoundError
@@ -209,7 +209,7 @@ def test_soft_deleted_customer_is_absent_for_writes(db):
 
 
 def test_manager_without_department_sees_pool_only(db):
-    """无部门主管是可达状态（用户接口允许把部门清空）：只见公海，且全不可写。"""
+    """无部门主管仍可能由历史数据/人工改库产生：只见公海，且全不可写。"""
     f = _fixture(db)
     boss_void = create_user(
         db,
@@ -217,8 +217,15 @@ def test_manager_without_department_sees_pool_only(db):
         password="Passw0rd!",
         display_name="无部门主管",
         role=ROLE_MANAGER,
-        department_id=None,
+        department_id=f["east"].id,
     )
+    # 建号路径已禁止无部门主管，这里模拟库里残留的无部门状态。
+    db.execute(
+        text("UPDATE users SET department_id = NULL WHERE id = :user_id"),
+        {"user_id": boss_void.id},
+    )
+    db.commit()
+    db.refresh(boss_void)
 
     # 无部门主管若退化成"department_id IS NULL 即本部门"，会把这条无部门客户放进来
     orphan = Customer(name="己公司", owner_id=f["sa"].id, department_id=None)

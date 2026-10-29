@@ -46,6 +46,16 @@ class CustomerUpdate(BaseModel):
     remark: str | None = None
 
 
+# 请求体字段白名单：创建与更新**故意不对称**，两处都显式列出，别再靠散落在
+# 代码里的 if 分支维持口径。
+# - 创建可传 owner_id：管理员/主管建客户时直接指定负责人，范围由 _resolve_owner 校验；
+# - 更新不可传 owner_id：转移客户必须写 owner_change_logs 并同步 department_id，
+#   走专门的领取/分配/转移流程（design §4.3）。若允许 PATCH 顺手改归属，
+#   既绕开审计日志，也会让两个冗余归属字段失去同步点。
+CUSTOMER_CREATE_FIELDS = frozenset(CustomerCreate.model_fields)
+CUSTOMER_UPDATE_FIELDS = frozenset(CustomerUpdate.model_fields)
+
+
 class CustomerOwnerUpdate(BaseModel):
     owner_id: int | None = None
     reason: str | None = None

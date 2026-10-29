@@ -77,11 +77,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "uq_contacts_customer_primary",
-        table_name="contacts",
-        postgresql_where=sa.text("is_primary AND deleted_at IS NULL"),
-    )
+    op.drop_index("uq_contacts_customer_primary", table_name="contacts")
     op.drop_index("ix_contacts_phone", table_name="contacts")
     op.drop_index("ix_contacts_customer_id", table_name="contacts")
     op.drop_table("contacts")

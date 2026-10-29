@@ -2,8 +2,14 @@
 
 读取一律从 :func:`app.db.scope.customer_query` 起步（design §2.3），写前一律
 :func:`app.db.scope.assert_customer_writable`；本模块只叠加业务过滤，不自拼
-``select(Customer)``——唯一的例外是重名软查重，见 :func:`find_similar_customers`。
+``select(Customer)``。**只有两处故意绕过作用域**，结构审计时必须一起看：
 
+1. :func:`find_similar_customers`：跨作用域重名软查重——别人建过、当前用户看不见
+   的同名客户也要命中，否则"看不见就查不出重复"，软查重等于没做；
+2. :func:`get_customer`：作用域内查不到时的存在性探针——只取 ``id`` 且限定未删除，
+   用来把 403（有记录但无权）与 404（记录不存在）分开。
+
+两处都不返回越权数据，但它们是 ``customer_query`` 之外仅有的读取入口。
 ``last_activity_at`` 的三条维护规则见 design §3.3。P1 还没有 activity 表，也没有
 领取/分配/转移接口（属后续阶段），所以这里只落"其余编辑一律不更新"这一半：
 创建不写该字段，编辑不碰它。
@@ -31,7 +37,11 @@ from app.modules.customers.models import (
     PROCUREMENT_TYPES,
     Customer,
 )
-from app.modules.customers.schemas import CustomerCreate, CustomerUpdate
+from app.modules.customers.schemas import (
+    CUSTOMER_UPDATE_FIELDS,
+    CustomerCreate,
+    CustomerUpdate,
+)
 from app.modules.users.models import User
 from app.modules.users.service import (
     ROLE_ADMIN,
@@ -280,14 +290,18 @@ def list_customers(
 
 
 def get_customer(db: Session, actor: User, customer_id: int) -> Customer:
-    """按作用域取单个客户：不存在 404，存在但无权限 403（design §5）。"""
+    """按作用域取单个客户：不存在 404，存在但无权限 403（design §5）。
+
+    作用域内查不到时，下面还有一个**裸 select 的存在性探针**——本模块两处故意
+    绕过 ``customer_query`` 的第二处（第一处是 :func:`find_similar_customers`）。
+    它只取 ``id``、限定 ``deleted_at IS NULL``，不返回任何业务字段；存在的意义是
+    把 403 与 404 分开，前端才能区分"没权限"与"记录没了"。
+    """
     customer = db.execute(
         customer_query(actor).where(Customer.id == customer_id)
     ).scalar_one_or_none()
     if customer is not None:
         return customer
-    # 作用域内查不到时，再判一次"到底有没有这条"：把 403 与 404 分开，
-    # 前端才能区分"没权限"与"记录没了"。
     exists = db.execute(
         select(Customer.id).where(
             Customer.id == customer_id, Customer.deleted_at.is_(None)
@@ -311,6 +325,11 @@ def update_customer(
     _validate_enums(payload)
 
     changes = payload.model_dump(exclude_unset=True)
+    # 白名单兜底：schema 已经 extra="forbid"，这里再挡一次是给绕过 schema 的调用方
+    # （脚本、后续新增路由）留同一道门，owner_id 尤其不能从这里溜进更新路径。
+    unknown = set(changes) - CUSTOMER_UPDATE_FIELDS
+    if unknown:
+        raise InvalidValueError(f"不可更新的字段：{'、'.join(sorted(unknown))}")
     for field, label in _REQUIRED_FIELDS.items():
         if field in changes and changes[field] is None:
             raise InvalidValueError(f"{label}不能为空")

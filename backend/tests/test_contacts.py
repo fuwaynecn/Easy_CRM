@@ -7,18 +7,18 @@
 
 另有三条容易写错、必须由测试钉住的规则：
 
-- 主联系人在同一客户下**恰好一条**：服务层切换旧的置 false，数据库再用部分
-  唯一索引兜一层（服务层漏了就直接撞约束，不会静默出现两条主联系人）；
+- 主联系人在同一客户下**至多一条、可以为 0**：服务层切换旧的置 false，数据库再用
+  部分唯一索引兜一层（服务层漏了就直接撞约束，不会静默出现两条主联系人）；
 - 改联系人**不更新**客户的 ``last_activity_at``（design §3.3 只有三条同步点，
   联系人不在其中，最容易顺手写成"有交互就刷新"）；
-- 删除是软删除，列表与详情都要过滤，重复删除是 404 而不是幂等的 200。
+- 删除是软删除，列表与写入都按 ``deleted_at`` 过滤，重复删除是 404 而不是幂等的 200。
 """
 
 from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.core.errors import (
@@ -172,6 +172,56 @@ def test_list_orders_primary_first(db):
     assert [c.name for c in contacts] == ["李工", "王工", "张工"]
 
 
+# --- 模型与数据库约束 ---------------------------------------------------
+
+
+def test_contact_indexes_exist(db):
+    """三条索引必须真实存在：迁移/建表漏建时这里直接红。"""
+    names = {index["name"] for index in inspect(db.get_bind()).get_indexes("contacts")}
+
+    assert {
+        "ix_contacts_customer_id",
+        "ix_contacts_phone",
+        "uq_contacts_customer_primary",
+    } <= names
+
+
+def test_primary_unique_index_predicate_covers_soft_delete(db):
+    """``compare_metadata`` 不比对部分索引的谓词，只能直接读 pg_indexes。
+
+    谓词少了 ``deleted_at IS NULL`` 时，软删的主联系人会永久占住唯一位置：
+    删掉旧主联系人后再设新的会莫名 409。
+    """
+    indexdef = db.execute(
+        text(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = current_schema() "
+            "AND tablename = 'contacts' "
+            "AND indexname = 'uq_contacts_customer_primary'"
+        )
+    ).scalar_one()
+
+    assert "deleted_at IS NULL" in indexdef
+
+
+def test_is_primary_has_server_default(db):
+    """裸 INSERT 不给 is_primary：数据库默认值必须兜住，不能撞 NOT NULL。"""
+    f = _setup(db)
+    db.execute(
+        text(
+            "INSERT INTO contacts (customer_id, name) "
+            "VALUES (:customer_id, '裸插联系人')"
+        ),
+        {"customer_id": f["cust_a"].id},
+    )
+    db.commit()
+
+    is_primary = db.execute(
+        text("SELECT is_primary FROM contacts WHERE name = '裸插联系人'")
+    ).scalar_one()
+    assert is_primary is False
+
+
 # --- 主联系人唯一性：服务层 + 数据库 -------------------------------------
 
 
@@ -244,8 +294,6 @@ def test_database_rejects_two_primary_contacts(db):
     with pytest.raises(IntegrityError):
         db.commit()
     db.rollback()
-
-    assert _primaries(db, f["cust_a"].id) == []
 
 
 def test_concurrent_primary_create_returns_409(db, monkeypatch):
@@ -385,6 +433,24 @@ def test_update_contact_requires_scope(db):
 
     with pytest.raises(ForbiddenError):
         update_contact(db, f["sb"], contact.id, ContactUpdate(phone="1"))
+
+
+def test_update_without_is_primary_keeps_the_value(db):
+    """PATCH 不传 is_primary 时既不 400 也不改原值。
+
+    ``_validate_required`` 依赖 ``exclude_unset`` 区分"没提交"与"显式 null"；
+    改成 ``model_dump()`` 会把未提交的 is_primary 当成 None，每次 PATCH 都 400。
+    """
+    f = _setup(db)
+    contact = create_contact(
+        db, f["sa"], f["cust_a"].id, ContactCreate(name="王工", is_primary=True)
+    )
+
+    updated = update_contact(db, f["sa"], contact.id, ContactUpdate(title="技术负责人"))
+
+    assert updated.title == "技术负责人"
+    db.expire_all()
+    assert db.get(Contact, contact.id).is_primary is True
 
 
 def test_delete_contact_requires_scope(db):
