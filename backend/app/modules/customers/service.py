@@ -113,6 +113,28 @@ def _validate_enums(payload: CustomerCreate | CustomerUpdate) -> None:
         raise InvalidValueError(f"未知客户状态：{status}")
 
 
+def _validate_filter_enums(
+    *,
+    level: str | None,
+    status: str | None,
+    procurement_type: str | None,
+    budget_status: str | None,
+) -> None:
+    """列表筛选的枚举取值非法是 400（不是空列表），取值以 design §3.3 为准。
+
+    返回空列表会让前端把"参数拼错了"显示成"没有数据"，与越权返回空列表是同一类
+    错误；空串按"未筛选"处理（前端清空下拉时会带 ``?level=``）。
+    """
+    for value, allowed, label in (
+        (level, CUSTOMER_LEVELS, "客户等级"),
+        (status, CUSTOMER_STATUSES, "客户状态"),
+        (procurement_type, PROCUREMENT_TYPES, "采购方式"),
+        (budget_status, BUDGET_STATUSES, "预算状态"),
+    ):
+        if value and value not in allowed:
+            raise InvalidValueError(f"未知{label}：{value}")
+
+
 def _resolve_owner(
     db: Session, actor: User, requested_owner_id: int | None
 ) -> User | None:
@@ -195,6 +217,12 @@ def list_customers(
     sort: str = "-created_at",
 ) -> tuple[list[Customer], int]:
     """作用域内的客户分页：返回当前页与总数（前端分页器要的是 total 不是本页数）。"""
+    _validate_filter_enums(
+        level=level,
+        status=status,
+        procurement_type=procurement_type,
+        budget_status=budget_status,
+    )
     stmt: Select = customer_query(actor)
     if keyword and keyword.strip():
         # % 与 _ 按字面量匹配：搜索 "%" 不能变成"列出全部客户"

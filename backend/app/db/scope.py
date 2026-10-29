@@ -6,6 +6,9 @@
   路由与服务层不要自己拼 ``select(Customer)``，否则漏一处就是一处越权或漏数据。
 - 公海客户（``owner_id IS NULL``）对 sales 与 manager 一律只读，判定写在
   :func:`customer_writable_scope` / :func:`can_write_customer` 里，不交给路由判断。
+- 未识别的角色（数据被手工改成 ``guest`` 之类）一律 fail-closed：只见公海、全部
+  不可写。回退到"等价 sales"会让未知角色看到自己名下的客户，回退到 ``true()``
+  则是全量泄露。
 
 ``customer_writable_scope``（SQL 条件）与 ``can_write_customer``（对象判定）必须给出
 同一集合，``tests/test_scope.py::test_writable_scope_matches_can_write_customer``
@@ -14,9 +17,9 @@
 
 from sqlalchemy import ColumnElement, Select, and_, false, or_, select, true
 
-from app.core.errors import ForbiddenError
+from app.core.errors import ForbiddenError, NotFoundError
 from app.modules.customers.models import Customer
-from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, User
+from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
 
 
 def _public_pool() -> ColumnElement[bool]:
@@ -39,8 +42,11 @@ def customer_scope(user: User) -> ColumnElement[bool]:
         if user.department_id is None:
             return _public_pool()
         return or_(Customer.department_id == user.department_id, _public_pool())
-    # 未识别的角色按最低权限处理（等价 sales），不静默放宽
-    return or_(Customer.owner_id == user.id, _public_pool())
+    if user.role == ROLE_SALES:
+        return or_(Customer.owner_id == user.id, _public_pool())
+    # 未识别的角色按最低权限处理：只见公海。比"等价 sales"更窄是刻意的——
+    # 未知角色不该因为"碰巧名下有客户"而拿到读取权。
+    return _public_pool()
 
 
 def customer_writable_scope(user: User) -> ColumnElement[bool]:
@@ -53,7 +59,10 @@ def customer_writable_scope(user: User) -> ColumnElement[bool]:
         if user.department_id is None:
             return false()
         return and_(owned, Customer.department_id == user.department_id)
-    return and_(owned, Customer.owner_id == user.id)
+    if user.role == ROLE_SALES:
+        return and_(owned, Customer.owner_id == user.id)
+    # 未识别的角色一律不可写：与 :func:`customer_scope` 的"只见公海"配套
+    return false()
 
 
 def customer_query(user: User) -> Select[tuple[Customer]]:
@@ -67,8 +76,14 @@ def customer_query(user: User) -> Select[tuple[Customer]]:
     )
 
 
-def can_write_customer(customer: Customer, user: User) -> bool:
-    """能否修改该客户。公海对 sales / manager 一律 False。"""
+def can_write_customer(customer: Customer | None, user: User) -> bool:
+    """能否修改该客户。公海对 sales / manager 一律 False。
+
+    ``None``（id 不存在）与已软删的记录同样 False：软删对外等同不存在，
+    行还在不等于可写。
+    """
+    if customer is None or customer.deleted_at is not None:
+        return False
     if user.role == ROLE_ADMIN:
         return True
     if customer.owner_id is None:
@@ -78,15 +93,20 @@ def can_write_customer(customer: Customer, user: User) -> bool:
             user.department_id is not None
             and customer.department_id == user.department_id
         )
-    return customer.owner_id == user.id
+    if user.role == ROLE_SALES:
+        return customer.owner_id == user.id
+    return False
 
 
-def assert_customer_writable(customer: Customer, user: User) -> None:
+def assert_customer_writable(customer: Customer | None, user: User) -> None:
     """越权写操作抛 403（不是 404、也不是空结果）。
 
     404 会让前端以为"记录没了"，空列表会让它以为"没数据"；这两种状态都必须和
-    "有数据但没权限" 区分开。
+    "有数据但没权限" 区分开。不存在（``None``）与已软删的记录对外表现为不存在，
+    因此抛 404 而不是 403：更新一条软删记录等于让它复活。
     """
+    if customer is None or customer.deleted_at is not None:
+        raise NotFoundError("客户不存在")
     if can_write_customer(customer, user):
         return
     if customer.owner_id is None:

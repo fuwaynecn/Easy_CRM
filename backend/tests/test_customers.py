@@ -841,3 +841,27 @@ def test_api_list_pagination_and_keyword(client, db):
     ).json()
     assert percent["total"] == 1
     assert [item["name"] for item in percent["items"]] == ["100%控股公司"]
+
+
+@pytest.mark.parametrize(
+    ("param", "value"),
+    [
+        ("level", "Z"),
+        ("status", "gone"),
+        ("procurement_type", "bid"),
+        ("budget_status", "maybe"),
+    ],
+    ids=["level", "status", "procurement", "budget"],
+)
+def test_api_list_rejects_invalid_filter_enum(client, db, param, value):
+    """筛选枚举非法是 400：空列表会把"参数拼错"伪装成"没有数据"。"""
+    _setup(db)
+
+    resp = client.get(
+        "/api/v1/customers",
+        headers=_auth(_token(client, "admin")),
+        params={param: value},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_value"
