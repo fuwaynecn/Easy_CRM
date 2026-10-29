@@ -4,30 +4,25 @@
 「销售A 看不到销售B 客户下的机会」，并且刻意在同一个部门里放两个销售：
 只有一个销售时"本部门"与"自己名下"恰好重合，把规则写错也能全绿。
 
-``Customer`` 与 ``StageChange`` 本任务还用不到，那是 Task 6（阶段变更）的测试要用的
-名字；这里一次性按最终形态摆好 import 区，不为一个名字再来改一趟。它们带
-``noqa: F401`` 是 ruff 对未使用 import 的硬性要求。
+公海客户建机会这条 400 只有 admin 走得到（sales/manager 先撞 403），因此两层各钉
+一条测试——否则"400 分支被 403 遮住"这件事在测试里完全看不出来。
 """
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
-from app.modules.customers.models import Customer  # noqa: F401
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
 from app.modules.lost_reasons.schemas import LostReasonCreate
 from app.modules.lost_reasons.service import create_lost_reason
 from app.modules.opportunities.models import Opportunity, StageHistory
-from app.modules.opportunities.schemas import (
-    OpportunityCreate,
-    OpportunityUpdate,
-    StageChange,  # noqa: F401
-)
+from app.modules.opportunities.schemas import OpportunityCreate, OpportunityUpdate
 from app.modules.opportunities.service import (
     board,
     create_opportunity,
@@ -323,13 +318,39 @@ def test_create_inherits_owner_from_customer_and_writes_history(db):
 
 
 def test_create_on_pool_customer_is_invalid(db):
-    """公海客户没有负责人，而机会 owner_id 是 NOT NULL（§3.5 负责人必须与客户一致）。"""
+    """公海客户没有负责人，而机会 owner_id 是 NOT NULL（§3.5 负责人必须与客户一致）。
+
+    这条 400 只有 admin 走得到：admin 对任何客户都可写，于是能穿过
+    ``assert_customer_writable`` 抵达「客户没有负责人」这个判断。销售/主管的对应
+    路径是下一条 403 测试——两层分开钉，是因为只测 admin 会让"400 被 403 遮住"
+    这件事在测试里完全不可见。
+    """
     f = _setup(db)
 
     with pytest.raises(InvalidValueError) as excinfo:
         _make(db, f["admin"], f["pool"])
 
     assert excinfo.value.status_code == 400
+    # 全局约束：不许只断言状态码。code 是前端分支的依据，message 是给用户的说法。
+    assert excinfo.value.code == "invalid_value"
+    assert "未分配负责人" in excinfo.value.message
+
+
+def test_create_on_pool_customer_as_sales_is_403(db):
+    """同样的公海客户，sales/manager 在可写性检查就被挡住（403，不是 400）。
+
+    钉住这条是为了说明「公海客户建不了机会」对销售的真实表现是"公海只读"，而不是
+    「客户未分配负责人」——否则前端会去引导用户"先给客户分配负责人"，而销售根本
+    没有这个权限。
+    """
+    f = _setup(db)
+
+    with pytest.raises(ForbiddenError) as excinfo:
+        _make(db, f["sa"], f["pool"])
+
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.code == "forbidden"
+    assert "公海" in excinfo.value.message
 
 
 def test_create_rejects_terminal_stage(db):
@@ -355,6 +376,23 @@ def test_create_on_foreign_customer_is_403(db):
 
     with pytest.raises(ForbiddenError):
         _make(db, f["sa"], f["cust_b"])
+
+
+def test_create_with_missing_customer_is_404(db):
+    """不存在的客户 id 是 404，不是 403、也不是外键撞出来的 500。
+
+    创建路径的第一道就是 ``get_customer``：它同时给出 403/404 的区分。若这里先
+    插行再靠外键报错，用户拿到的是 500，前端无法区分"客户被删了"和"服务崩了"。
+    """
+    f = _setup(db)
+
+    with pytest.raises(NotFoundError) as excinfo:
+        create_opportunity(
+            db, f["sa"], OpportunityCreate(customer_id=999999, name="孤儿机会")
+        )
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
 
 
 def test_create_keeps_manual_win_rate(db):
@@ -391,6 +429,9 @@ def test_update_changes_only_submitted_fields(db):
     assert str(updated.amount) == "900.00"
     assert updated.stage == "contact"          # 阶段只能走 /stage
     assert updated.won_at is None
+    # 改金额**不**追加 history：§3.7 的 history 只记阶段变更。只有创建时那一行，
+    # 否则"漏斗各阶段进了多少单"会被普通编辑灌成假数据。
+    assert len(_history_rows(db, opportunity.id)) == 1
 
 
 def test_update_can_clear_win_rate_back_to_auto(db):
@@ -425,6 +466,40 @@ def test_update_foreign_opportunity_is_403(db):
         )
 
 
+def test_update_deleted_opportunity_is_404(db):
+    """已软删的机会对编辑等同不存在：404，不是"改成功了但看不见"。
+
+    编辑一条软删记录在语义上就是让它局部复活（名字/金额变新，但仍不在列表里），
+    那是最难排查的一类数据不一致。
+    """
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    opportunity.deleted_at = datetime.now(UTC)
+    db.commit()
+
+    with pytest.raises(NotFoundError) as excinfo:
+        update_opportunity(
+            db, f["sa"], opportunity.id, OpportunityUpdate(name="复活它")
+        )
+
+    assert excinfo.value.code == "not_found"
+
+
+def test_update_schema_rejects_non_editable_fields():
+    """stage / owner_id / won_at 提交即 422——它们是白名单的第一道门。
+
+    ``OpportunityUpdate`` 的 ``extra="forbid"`` 与字段表本身承担这道拒绝；service 的
+    字面量 ``UPDATABLE_FIELDS`` 是第二道。此前没有任何测试钉住"提交了会被拒"：
+    白名单一旦退化成 schema 的镜像，这条拒绝就全靠 schema，而 schema 无人看守。
+    """
+    with pytest.raises(ValidationError):
+        OpportunityUpdate(stage="won")
+    with pytest.raises(ValidationError):
+        OpportunityUpdate(owner_id=1)
+    with pytest.raises(ValidationError):
+        OpportunityUpdate(won_at=datetime.now(UTC))
+
+
 # --- 写入：删除 ----------------------------------------------------------
 
 
@@ -445,7 +520,10 @@ def test_manager_soft_deletes_and_second_delete_is_404(db):
     db.expire_all()
     row = db.get(Opportunity, opportunity.id)
     assert row.deleted_at is not None
-    assert _history_rows(db, opportunity.id) != []      # 历史不跟着删
+    # 历史不跟着删，而且**恰好一行**：删除动作本身不应写 history（它只改 deleted_at）
+    history = _history_rows(db, opportunity.id)
+    assert len(history) == 1
+    assert history[0].to_stage == "contact"             # 创建时那一行，未被改写
 
     with pytest.raises(NotFoundError):
         delete_opportunity(db, f["boss"], opportunity.id)

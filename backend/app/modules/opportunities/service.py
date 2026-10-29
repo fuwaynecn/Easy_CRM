@@ -44,8 +44,14 @@ BOARD_COLUMN_LIMIT = 200
 # 库里的 NOT NULL 列：显式传 null 不能落库，按取值非法（400）而不是撞 500
 _REQUIRED_FIELDS = {"name": "机会名称", "amount": "预计金额"}
 
-# update 认的字段，与 schemas.OpportunityUpdate 一一对应（多一道白名单兜底）
-UPDATABLE_FIELDS = frozenset(OpportunityUpdate.model_fields)
+# update 认的字段，与 schemas.OpportunityUpdate 一一对应（多一道白名单兜底）。
+# **字面量而不是 `frozenset(OpportunityUpdate.model_fields)`**：从 schema 派生等于把
+# 白名单变成 schema 的镜像，这道门就永远关不住任何东西（`unknown` 分支不可达），
+# 而 Task 6 往 schema 加一个字段会**顺手**把这个字段放进可编辑集合。写成字面量后，
+# 任何新增字段都必须在这里被有意识地加一次；两边不一致时下面的 `unknown` 会 400。
+UPDATABLE_FIELDS = frozenset(
+    {"name", "amount", "expected_close_date", "competitor", "win_rate"}
+)
 
 
 @dataclass(frozen=True)
@@ -300,6 +306,10 @@ def create_opportunity(
     name = _clean_name(payload.name)
     _validate_stage_for_create(payload.stage)
     customer = _writable_customer(db, actor, payload.customer_id)
+    # 下面这条 400 只有在**调用方对该客户可写**时才能走到：sales/manager 遇到公海客户
+    # 已经在 `assert_customer_writable` 里拿到 403「公海客户只读」，admin 才走到这里。
+    # 两层不是重复——403 说的是"你对这个客户没有写权限"，400 说的是"这个客户没有负责人，
+    # 建不了机会"；将来若公海对某个角色放开写权限，400 仍然成立。
     if customer.owner_id is None:
         raise InvalidValueError("客户未分配负责人，请先领取或分配后再新建机会")
 
