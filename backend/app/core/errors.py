@@ -26,6 +26,13 @@ class NotFoundError(AppError):
     code = "not_found"
 
 
+class WeakPasswordError(AppError):
+    """口令不满足最低强度：400，供创建用户与重置口令共用。"""
+
+    status_code = 400
+    code = "weak_password"
+
+
 class ConflictError(AppError):
     status_code = 409
     code = "conflict"

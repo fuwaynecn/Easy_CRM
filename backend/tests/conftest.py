@@ -49,9 +49,15 @@ def engine() -> Iterator[Engine]:
 
 @pytest.fixture(scope="session", autouse=True)
 def _bind_sessionlocal(engine: Engine) -> Iterator[None]:
-    """把常驻的 SessionLocal 也绑到测试库，避免绕过 get_db 的代码写开发库。"""
+    """把常驻的 SessionLocal 与模块级 engine 都绑到测试库。
+
+    只改 SessionLocal 不够：`app.db.session.engine` 仍指向开发库，任何直接
+    引用该模块变量的代码都会写开发库。
+    """
+    import app.db.session as session_module
     from app.db.session import SessionLocal
 
+    session_module.engine = engine
     SessionLocal.configure(bind=engine)
     yield
 

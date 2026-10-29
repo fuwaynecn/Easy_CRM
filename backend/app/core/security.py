@@ -23,8 +23,16 @@ def hash_password(raw: str) -> str:
     return _password_hash.hash(raw)
 
 
-def verify_password(raw: str, hashed: str) -> bool:
-    return _password_hash.verify(raw, hashed)
+def verify_password(raw: str, hashed: str | None) -> bool:
+    """校验口令；脏哈希（空串、None、非 argon2）一律返回 False。
+
+    外部导入的数据可能带来无法解析的哈希，这里必须吞掉异常。异常分支不落日志：
+    日志里既不能有明文口令，也不能有口令哈希。
+    """
+    try:
+        return _password_hash.verify(raw, hashed or "")
+    except Exception:  # noqa: BLE001 — 脏哈希的异常类型不可枚举，必须全部吞掉
+        return False
 
 
 # 固定假哈希：用户不存在时也跑一次等价耗时的校验，避免响应时间暴露账号是否存在。

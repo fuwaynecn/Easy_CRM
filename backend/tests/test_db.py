@@ -1,6 +1,12 @@
 from sqlalchemy import text
 
+import app.db.session as session_module
 from app.db.base import Base
+
+
+def test_module_engine_is_rebound_to_test_database(engine):
+    """`app.db.session.engine` 也必须指向测试库，不能留开发库。"""
+    assert session_module.engine is engine
 
 
 def test_database_is_postgres(db):

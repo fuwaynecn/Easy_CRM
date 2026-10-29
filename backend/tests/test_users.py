@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from app.core.errors import (
@@ -6,9 +8,11 @@ from app.core.errors import (
     LockedError,
     NotFoundError,
     UnauthorizedError,
+    WeakPasswordError,
 )
 from app.core.security import hash_password, verify_password
 from app.modules.departments.service import create_department
+from app.modules.users.schemas import PasswordReset, UserCreate
 from app.modules.users.service import (
     ROLE_SALES,
     authenticate,
@@ -19,11 +23,91 @@ from app.modules.users.service import (
 )
 
 
+def _make_sales_user(db, *, username="zhangsan", password="Passw0rd!"):
+    dept = create_department(db, "华东销售部")
+    return create_user(
+        db,
+        username=username,
+        password=password,
+        display_name="张三",
+        role=ROLE_SALES,
+        department_id=dept.id,
+    )
+
+
+def _fail_login(db, times, *, username="zhangsan", password="bad"):
+    for _ in range(times):
+        with pytest.raises(UnauthorizedError):
+            authenticate(db, username, password)
+
+
 def test_password_hash_roundtrip():
     hashed = hash_password("Passw0rd!")
     assert hashed != "Passw0rd!"
     assert verify_password("Passw0rd!", hashed) is True
     assert verify_password("wrong", hashed) is False
+
+
+@pytest.mark.parametrize("dirty_hash", ["", "not-a-hash", None])
+def test_verify_password_returns_false_for_dirty_hash(dirty_hash):
+    """外部导入的脏哈希必须返回 False，不能抛异常（否则登录路径 500）。"""
+    assert verify_password("x", dirty_hash) is False
+
+
+def test_user_create_and_password_reset_repr_hide_password():
+    created = UserCreate(
+        username="zhangsan",
+        password="Passw0rd!",
+        display_name="张三",
+        role=ROLE_SALES,
+    )
+    reset = PasswordReset(new_password="NewPass!23")
+    assert "Passw0rd!" not in repr(created)
+    assert "NewPass!23" not in repr(reset)
+    assert created.password.get_secret_value() == "Passw0rd!"
+    assert reset.new_password.get_secret_value() == "NewPass!23"
+
+
+def test_short_password_is_400_business_error_without_plaintext(db):
+    """口令长度不在 schema 层校验，因此不会有 422 的 input 回显；由 service 抛 400。"""
+    plain = "Ab123"
+    payload = UserCreate(
+        username="shorty",
+        password=plain,
+        display_name="短口令",
+        role=ROLE_SALES,
+    )
+    # schema 接受该输入，说明约束没有挂在字段上（否则 422 已在此抛出）
+    assert payload.password.get_secret_value() == plain
+
+    with pytest.raises(WeakPasswordError) as excinfo:
+        create_user(
+            db,
+            username=payload.username,
+            password=payload.password.get_secret_value(),
+            display_name=payload.display_name,
+            role=payload.role,
+            department_id=None,
+        )
+    error = excinfo.value
+    assert error.status_code == 400
+    assert error.code == "weak_password"
+    assert plain not in str(error)
+    assert plain not in repr(error)
+    assert plain not in error.message
+    assert error.detail is None
+    assert get_user_by_username(db, "shorty") is None
+
+
+def test_reset_password_rejects_short_password_and_keeps_old_hash(db):
+    user = _make_sales_user(db)
+    old_hash = user.password_hash
+    with pytest.raises(WeakPasswordError) as excinfo:
+        reset_password(db, user.id, "Ab123")
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.code == "weak_password"
+    assert "Ab123" not in str(excinfo.value)
+    assert user.password_hash == old_hash
 
 
 def test_create_user_stores_hash_not_plaintext(db):
@@ -78,7 +162,6 @@ def test_authenticate_success_updates_last_login(db):
     )
     user = authenticate(db, "zhangsan", "Passw0rd!")
     assert user.last_login_at is not None
-    assert user.failed_login_count == 0
 
 
 def test_authenticate_wrong_password_counts_failure(db):
@@ -116,6 +199,63 @@ def test_authenticate_locks_after_five_failures(db):
         authenticate(db, "zhangsan", "Passw0rd!")
     assert excinfo.value.status_code == 423
     assert "锁定" in excinfo.value.message
+
+
+def test_lock_threshold_is_exactly_five_failures(db):
+    """第 4 次失败后仍不锁定，第 5 次才锁定：阈值必须精确为 5。"""
+    _make_sales_user(db)
+    _fail_login(db, 4)
+    user = get_user_by_username(db, "zhangsan")
+    assert user.failed_login_count == 4
+    assert user.locked_until is None
+
+    _fail_login(db, 1)
+    user = get_user_by_username(db, "zhangsan")
+    assert user.locked_until is not None
+
+
+def test_locked_account_rejects_correct_password_with_423(db):
+    _make_sales_user(db)
+    _fail_login(db, 5)
+    with pytest.raises(LockedError) as excinfo:
+        authenticate(db, "zhangsan", "Passw0rd!")
+    assert excinfo.value.status_code == 423
+    assert "锁定" in excinfo.value.message
+
+
+def test_login_succeeds_after_lock_expires_and_resets_counter(db):
+    _make_sales_user(db)
+    _fail_login(db, 5)
+    user = get_user_by_username(db, "zhangsan")
+    assert user.locked_until is not None
+
+    # 不等 15 分钟：直接把锁定到期时间拨到过去
+    user.locked_until = datetime.now(UTC) - timedelta(minutes=1)
+    db.commit()
+
+    # 到期后再失败一次，让计数非零，才能验证成功登录确实把计数清零
+    _fail_login(db, 1)
+    assert get_user_by_username(db, "zhangsan").failed_login_count == 1
+
+    authed = authenticate(db, "zhangsan", "Passw0rd!")
+    assert authed.failed_login_count == 0
+    assert authed.locked_until is None
+
+
+def test_reset_password_clears_failures_and_lock_immediately(db):
+    _make_sales_user(db)
+    _fail_login(db, 3)
+    user = get_user_by_username(db, "zhangsan")
+    user.locked_until = datetime.now(UTC) + timedelta(minutes=15)
+    db.commit()
+
+    updated = reset_password(db, user.id, "NewPass!23")
+    assert updated.failed_login_count == 0
+    assert updated.locked_until is None
+
+    authed = authenticate(db, "zhangsan", "NewPass!23")
+    assert authed.failed_login_count == 0
+    assert authed.locked_until is None
 
 
 def test_authenticate_unknown_user_and_wrong_password_share_message(db):

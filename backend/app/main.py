@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -5,14 +7,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.config import settings
+from app.core.config import DEV_JWT_SECRET_PLACEHOLDER, settings
 from app.core.errors import AppError
 from app.modules.auth.router import me_router
 from app.modules.auth.router import router as auth_router
 from app.modules.departments.router import router as departments_router
 
+logger = logging.getLogger(__name__)
+
 
 def create_app() -> FastAPI:
+    if settings.jwt_secret == DEV_JWT_SECRET_PLACEHOLDER:
+        logger.warning(
+            "当前 JWT 密钥仍是开发占位值，请通过环境变量 JWT_SECRET 配置真实密钥"
+        )
+
     app = FastAPI(title="Easy CRM API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,

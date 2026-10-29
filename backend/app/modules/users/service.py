@@ -11,6 +11,7 @@ from app.core.errors import (
     LockedError,
     NotFoundError,
     UnauthorizedError,
+    WeakPasswordError,
 )
 from app.core.security import DECOY_PASSWORD_HASH, hash_password, verify_password
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLES, User
@@ -30,6 +31,18 @@ __all__ = [
 
 # 用户不存在与口令错误必须给出完全相同的对外文案，避免账号存在性探测
 INVALID_CREDENTIALS_MESSAGE = "用户名或密码错误"
+
+MIN_PASSWORD_LENGTH = 8
+
+
+def _validate_password(password: str) -> None:
+    """口令最短长度在 service 层校验。
+
+    不放在 schema 的 Field 约束上：字段一旦挂约束，Pydantic 会把原始输入
+    回显到 422 响应体的 detail[].input，等于把明文口令写进响应。
+    """
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise WeakPasswordError(f"密码长度不能少于 {MIN_PASSWORD_LENGTH} 位")
 
 
 def _now() -> datetime:
@@ -56,6 +69,7 @@ def create_user(
     department_id: int | None,
 ) -> User:
     cleaned_username = username.strip()
+    _validate_password(password)
     if role not in ROLES:
         raise ConflictError(f"未知角色：{role}")
     if get_user_by_username(db, cleaned_username) is not None:
@@ -126,6 +140,7 @@ def reset_password(db: Session, user_id: int, new_password: str) -> User:
     user = db.get(User, user_id)
     if user is None:
         raise NotFoundError("用户不存在")
+    _validate_password(new_password)
     user.password_hash = hash_password(new_password)
     user.failed_login_count = 0
     user.locked_until = None
