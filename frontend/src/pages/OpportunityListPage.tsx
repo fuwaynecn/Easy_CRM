@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { errorMessage } from "../api/client";
@@ -12,7 +12,7 @@ import {
   STAGE_LABELS,
   STAGE_ORDER,
   formatAmount,
-  formatDate,
+  formatDateOnly,
   isTerminalStage,
 } from "../constants/opportunityLabels";
 
@@ -51,7 +51,22 @@ export default function OpportunityListPage() {
   });
 
   const data = query.data;
+  // 页码一律以服务端回显为准（后端可能把越界页钳制回最后一页）。
+  const currentPage = data?.page ?? page;
   const pageCount = Math.max(1, Math.ceil((data?.total ?? 0) / Math.max(1, data?.page_size ?? 20)));
+
+  // 越界回落：停止筛选后第 2 页只剩 1 条、这条又被推进出当前筛选范围时，
+  // 本地 page 会停在一个不存在的页上——分页栏因为 total 变小而消失，用户就卡在
+  // 只有「暂无机会」的死胡同里。与 CustomerListPage 同一写法。
+  // 占位数据（keepPreviousData）是上一组查询的结果，不能拿它来同步页码。
+  useEffect(() => {
+    if (!data || query.isPlaceholderData) return;
+    if (data.page !== page) {
+      setPage(data.page);
+      return;
+    }
+    if (data.items.length === 0 && page > 1) setPage(pageCount);
+  }, [data, page, pageCount, query.isPlaceholderData]);
 
   function stageBadge(value: string) {
     return (
@@ -149,7 +164,7 @@ export default function OpportunityListPage() {
                     {/* 金额只格式化、不做数值运算：后端保证两位小数的定点字符串 */}
                     <td className="whitespace-nowrap px-3 py-2">{formatAmount(item.amount)}</td>
                     <td className="whitespace-nowrap px-3 py-2 text-slate-600">
-                      {formatDate(item.expected_close_date)}
+                      {formatDateOnly(item.expected_close_date)}
                     </td>
                     <td className="break-words px-3 py-2 text-slate-600">{item.owner_name}</td>
                     <td className="whitespace-nowrap px-3 py-2">
@@ -163,11 +178,21 @@ export default function OpportunityListPage() {
                       {isTerminalStage(item.stage) ? null : (
                         <button
                           type="button"
-                          className="ml-2 text-slate-500 hover:text-brand-600"
+                          // 用 isPending 守卫：同一行的双击会发出两个 POST，第二个必然
+                          // 400「机会已处于该阶段」，红字看起来像真出错了。
+                          disabled={advance.isPending}
+                          className="ml-2 text-slate-500 hover:text-brand-600 disabled:opacity-40"
                           onClick={() => {
+                            if (advance.isPending) return;
                             const index = (STAGE_ORDER as readonly string[]).indexOf(item.stage);
                             const next = STAGE_ORDER[index + 1];
-                            if (next) advance.mutate({ id: item.id, next });
+                            if (!next) return;
+                            // 赢单是终态且会写入 won_at（之后只能由 manager/admin 重开），
+                            // 点错一下就要走重开流程，所以先确认。
+                            if (next === "won" && !window.confirm("确认标记为赢单？此操作会写入赢单时间")) {
+                              return;
+                            }
+                            advance.mutate({ id: item.id, next });
                           }}
                         >
                           推进
@@ -192,7 +217,7 @@ export default function OpportunityListPage() {
                     {item.customer_name}
                   </Link>
                   {" · "}
-                  {formatAmount(item.amount)} · {formatDate(item.expected_close_date)}
+                  {formatAmount(item.amount)} · {formatDateOnly(item.expected_close_date)}
                 </p>
                 <p className="break-words text-xs text-slate-500">
                   负责人：{item.owner_name} · 赢单率 {item.win_rate}%
@@ -219,21 +244,21 @@ export default function OpportunityListPage() {
           {data && data.total > data.page_size ? (
             <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600">
               <span>
-                共 {data.total} 条，第 {data.page} / {pageCount} 页
+                共 {data.total} 条，第 {currentPage} / {pageCount} 页
               </span>
               <div className="flex gap-2">
                 <button
                   type="button"
-                  disabled={data.page <= 1}
-                  onClick={() => setPage(data.page - 1)}
+                  disabled={currentPage <= 1}
+                  onClick={() => setPage(Math.max(1, currentPage - 1))}
                   className="rounded border border-slate-300 px-2 py-1 disabled:opacity-40"
                 >
                   上一页
                 </button>
                 <button
                   type="button"
-                  disabled={data.page >= pageCount}
-                  onClick={() => setPage(data.page + 1)}
+                  disabled={currentPage >= pageCount}
+                  onClick={() => setPage(currentPage + 1)}
                   className="rounded border border-slate-300 px-2 py-1 disabled:opacity-40"
                 >
                   下一页

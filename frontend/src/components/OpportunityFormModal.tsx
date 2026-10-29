@@ -4,8 +4,9 @@ import { useState } from "react";
 import { errorMessage } from "../api/client";
 import { listCustomers } from "../api/customers";
 import { createOpportunity, updateOpportunity } from "../api/opportunities";
-import type { Opportunity } from "../api/types";
-import { OPEN_STAGES, STAGE_LABELS } from "../constants/opportunityLabels";
+import type { OpportunityCreateBody, OpportunityUpdateBody } from "../api/opportunities";
+import type { OpenStage, Opportunity } from "../api/types";
+import { isOpenStage, OPEN_STAGES, STAGE_LABELS } from "../constants/opportunityLabels";
 import { Field } from "./Field";
 import { Modal } from "./Modal";
 
@@ -24,7 +25,11 @@ interface FormState {
   expected_close_date: string;
   competitor: string;
   win_rate: string;
-  stage: string;
+  /**
+   * 只有新建时才提交阶段。收窄成 `OpenStage` 而不是 `string`：终态（won/lost）
+   * 只能由 `/opportunities/{id}/stage` 产生，创建体根本不该有它们的类型位置。
+   */
+  stage: OpenStage;
 }
 
 const EMPTY_FORM: FormState = {
@@ -47,9 +52,82 @@ function toForm(opportunity: Opportunity): FormState {
     competitor: opportunity.competitor ?? "",
     // 手工值才回填；跟随阶段的（win_rate_manual=false）留空，保存后仍是自动值
     win_rate: opportunity.win_rate_manual ? String(opportunity.win_rate) : "",
-    stage: opportunity.stage,
+    // 编辑态不提交 stage（下拉禁用，显示直接用 opportunity.stage），这里只需给
+    // OpenStage 表单一个合法初值；终态落回 contact 不会被提交，见 parseForm 的调用点。
+    stage: isOpenStage(opportunity.stage) ? opportunity.stage : "contact",
   };
 }
+
+/** 赢单率是 0–100 的整数百分比：`50%`、`五成`、`50.5`、`10 0` 都不合法。 */
+const WIN_RATE_PATTERN = /^\d{1,3}$/;
+
+/** 金额：非负、整数或最多两位小数（匹配前先去掉千分位逗号与空白，见 parseForm）。 */
+const AMOUNT_PATTERN = /^\d+(\.\d{1,2})?$/;
+
+/** 字段级校验结果：哪个字段红了，就在对应输入框下面显示哪一句。 */
+interface FieldErrors {
+  amount?: string;
+  win_rate?: string;
+}
+
+type ParsedForm =
+  | {
+      ok: true;
+      name: string;
+      amount: string;
+      expectedCloseDate: string | null;
+      competitor: string | null;
+      winRate: number | null;
+    }
+  | { ok: false; errors: FieldErrors };
+
+/**
+ * 表单 → 请求体字段的统一出口，**校验与解析在同一个函数里**。
+ *
+ * 这样写是为了堵死一条静默写坏数据的路径：上一版在 `mutationFn` 里直接
+ * `Number(form.win_rate)`，用户填 `50%`（标签就写着「赢单率 %」，填百分号完全
+ * 合理）得到 `NaN`，`JSON.stringify` 把它序列化成 `null`，后端再把 `win_rate:
+ * null` 读成「回到跟随阶段」并返回 200——手填的赢单率被清空且毫无提示。
+ *
+ * 现在 `win_rate` 的数值只有一个构造点，就在正则通过之后；不合法时返回的载荷里
+ * 根本没有这个字段，调用方拿不到可提交的 `NaN`，也不需要记得先校验。**注意这是
+ * 结构上的保证，不是类型系统给的**（`number` 本身就包含 `NaN`），所以要靠
+ * 「校验与解析同一个函数、mutationFn 只接收成品载荷」这条结构钉住。
+ *
+ * 空值仍然合法：赢单率空 = 跟随阶段（null），金额空 = 0。
+ */
+function parseForm(form: FormState): ParsedForm {
+  const errors: FieldErrors = {};
+
+  // 列表里金额显示成 1,800,000.00，用户会照抄着填回来；后端 Decimal 解析不了逗号
+  // （直接 422），所以先去掉千分位逗号与所有空白，再按定点小数校验。
+  const amount = form.amount.replace(/[,\s]/g, "");
+  if (amount !== "" && !AMOUNT_PATTERN.test(amount)) {
+    errors.amount = "金额请填写数字，最多两位小数";
+  }
+
+  const rawWinRate = form.win_rate.trim();
+  if (rawWinRate !== "" && (!WIN_RATE_PATTERN.test(rawWinRate) || Number(rawWinRate) > 100)) {
+    errors.win_rate = "赢单率请填 0-100 的整数";
+  }
+
+  if (errors.amount || errors.win_rate) return { ok: false, errors };
+
+  return {
+    ok: true,
+    name: form.name.trim(),
+    amount: amount === "" ? "0" : amount,
+    // 清空日期必须传 null（后端只认 null 表示清空）；空串会被 422 拦下
+    expectedCloseDate: form.expected_close_date || null,
+    competitor: form.competitor.trim() || null,
+    winRate: rawWinRate === "" ? null : Number(rawWinRate),
+  };
+}
+
+/** mutation 的入参：载荷在 `submit()` 里一次构造完，mutationFn 只负责发请求。 */
+type SubmitPayload =
+  | { kind: "create"; body: OpportunityCreateBody }
+  | { kind: "edit"; id: number; body: OpportunityUpdateBody };
 
 /**
  * 机会的新建/编辑弹窗。
@@ -71,6 +149,8 @@ export function OpportunityFormModal({
     opportunity ? toForm(opportunity) : EMPTY_FORM,
   );
   const [error, setError] = useState<string | null>(null);
+  // 本地字段校验：与后端错误分开存，本地红字在对应输入框下面，后端错误在底部
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   // 创建时必须选定客户：先按关键字搜，再从结果里点一条
   const [customerKeyword, setCustomerKeyword] = useState("");
   const [selectedCustomer, setSelectedCustomer] = useState<{ id: number; name: string } | null>(
@@ -85,31 +165,12 @@ export function OpportunityFormModal({
   });
 
   const mutation = useMutation({
-    mutationFn: () => {
-      // 赢单率是 0–100 的整数百分比，不是金额：这里的 Number() 是合法的，
-      // 别把它当成「金额也能转数字」的先例。
-      const winRate = form.win_rate.trim() === "" ? null : Number(form.win_rate);
-      if (mode === "edit" && opportunity) {
-        return updateOpportunity(opportunity.id, {
-          name: form.name.trim(),
-          amount: form.amount.trim(),
-          // 清空日期必须传 null（后端只认 null 表示清空）；空串会被 422 拦下
-          expected_close_date: form.expected_close_date || null,
-          competitor: form.competitor.trim() || null,
-          win_rate: winRate,
-        });
-      }
-      if (selectedCustomer === null) throw new Error("请先选择客户");
-      return createOpportunity({
-        customer_id: selectedCustomer.id,
-        name: form.name.trim(),
-        stage: form.stage,
-        amount: form.amount.trim(),
-        expected_close_date: form.expected_close_date || null,
-        competitor: form.competitor.trim() || null,
-        win_rate: winRate,
-      });
-    },
+    // 载荷是已校验过的成品（见 parseForm）：这里既不转数字、也不拼字段，
+    // 所以「非法输入被静默写坏」没有第二次发生的入口。
+    mutationFn: (payload: SubmitPayload) =>
+      payload.kind === "create"
+        ? createOpportunity(payload.body)
+        : updateOpportunity(payload.id, payload.body),
     onMutate: () => setError(null),
     onSuccess: async () => {
       // 列表与看板是两个查询键，都要失效：改金额/负责人会影响看板列头合计
@@ -121,6 +182,39 @@ export function OpportunityFormModal({
     // 前端不自己编一套，避免同一件事两处口径不一致。
     onError: (err) => setError(errorMessage(err, "保存失败，请重试")),
   });
+
+  /**
+   * 保存前先做字段级本地校验：不合法就在弹窗内给红字并**阻止提交**。
+   * 不依赖后端 422——那条路上用户只看到笼统的「提交内容不合规」，而赢单率填
+   * `50%` 更糟：后端 200，值被静默清空。
+   */
+  function submit() {
+    const parsed = parseForm(form);
+    if (!parsed.ok) {
+      setFieldErrors(parsed.errors);
+      return;
+    }
+    setFieldErrors({});
+    const body = {
+      name: parsed.name,
+      amount: parsed.amount,
+      expected_close_date: parsed.expectedCloseDate,
+      competitor: parsed.competitor,
+      win_rate: parsed.winRate,
+    };
+    if (mode === "edit" && opportunity) {
+      mutation.mutate({ kind: "edit", id: opportunity.id, body });
+      return;
+    }
+    if (selectedCustomer === null) {
+      setError("请先选择客户");
+      return;
+    }
+    mutation.mutate({
+      kind: "create",
+      body: { ...body, customer_id: selectedCustomer.id, stage: form.stage },
+    });
+  }
 
   const customerLabel = fixedCustomer?.name ?? opportunity?.customer_name ?? "";
 
@@ -183,7 +277,12 @@ export function OpportunityFormModal({
             label="预计金额"
             inputMode="decimal"
             value={form.amount}
-            onChange={(e) => setForm({ ...form, amount: e.target.value })}
+            error={fieldErrors.amount}
+            onChange={(e) => {
+              setForm({ ...form, amount: e.target.value });
+              // 改动即撤掉旧红字：提示停在已经改过的输入框下面会让人以为还没改好
+              setFieldErrors((prev) => ({ ...prev, amount: undefined }));
+            }}
           />
           <Field
             label="预计成交日"
@@ -203,15 +302,24 @@ export function OpportunityFormModal({
             label="赢单率 %（留空跟随阶段）"
             inputMode="numeric"
             value={form.win_rate}
-            onChange={(e) => setForm({ ...form, win_rate: e.target.value })}
+            error={fieldErrors.win_rate}
+            onChange={(e) => {
+              setForm({ ...form, win_rate: e.target.value });
+              setFieldErrors((prev) => ({ ...prev, win_rate: undefined }));
+            }}
           />
           <label className="block">
             <span className="mb-1 block text-sm font-medium text-slate-700">阶段</span>
             <select
-              value={form.stage}
+              // 编辑态显示机会自己的阶段（可能是终态），新建态显示表单值：
+              // 编辑不提交 stage，两个来源不会打架。
+              value={mode === "edit" && opportunity ? opportunity.stage : form.stage}
               // 编辑时不允许在这里改阶段：改阶段必须走 /stage，后端 PATCH 也不接受 stage
               disabled={mode === "edit"}
-              onChange={(e) => setForm({ ...form, stage: e.target.value })}
+              onChange={(e) => {
+                const value = e.target.value;
+                if (isOpenStage(value)) setForm({ ...form, stage: value });
+              }}
               className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-100"
             >
               {OPEN_STAGES.map((stage) => (
@@ -219,9 +327,10 @@ export function OpportunityFormModal({
                   {STAGE_LABELS[stage]}
                 </option>
               ))}
-              {/* 编辑终态机会时，当前阶段不在 OPEN_STAGES 里，补一个只读选项，
-                  否则下拉会显示成空白，看着像「阶段丢了」。 */}
-              {mode === "edit" && opportunity ? (
+              {/* 编辑终态机会时当前阶段不在 OPEN_STAGES 里，补一个选项，否则下拉会
+                  显示成空白，看着像「阶段丢了」。只在**不在**推进阶段里时补：否则
+                  OPEN_STAGES.map 已经渲染过同值 option，下拉里会出现两行一样的。 */}
+              {mode === "edit" && opportunity && !isOpenStage(opportunity.stage) ? (
                 <option value={opportunity.stage}>{STAGE_LABELS[opportunity.stage]}</option>
               ) : null}
             </select>
@@ -249,7 +358,7 @@ export function OpportunityFormModal({
               mutation.isPending ||
               (mode === "create" && selectedCustomer === null)
             }
-            onClick={() => mutation.mutate()}
+            onClick={submit}
             className="rounded-md bg-brand-500 px-3 py-2 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-60"
           >
             {mutation.isPending ? "保存中…" : "保存"}

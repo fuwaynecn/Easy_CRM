@@ -5,6 +5,8 @@
  * `STAGE_ORDER` 的顺序就是看板列的顺序，不要按标签字母序重排。
  */
 
+import type { OpenStage } from "../api/types";
+
 export const STAGE_LABELS: Record<string, string> = {
   contact: "初步接触",
   needs: "需求确认",
@@ -23,13 +25,24 @@ export const STAGE_ORDER = [
   "lost",
 ] as const;
 
-/** 推进阶段：新建机会时只能选这几个（后端也只接受这几个）。 */
-export const OPEN_STAGES = [
+/**
+ * 推进阶段：新建机会时只能选这几个（后端也只接受这几个）。
+ *
+ * 标注成 `readonly OpenStage[]` 而不是 `as const` 元组：字面量联合的唯一真值源
+ * 在 `api/types.ts`（`types.ts` 不能反过来依赖常量，否则成为循环）。这里的元素
+ * 一旦与 `OpenStage` 不一致，`tsc` 直接报错。
+ */
+export const OPEN_STAGES: readonly OpenStage[] = [
   "contact",
   "needs",
   "proposal",
   "negotiation",
-] as const;
+];
+
+/** 类型谓词：把任意阶段字符串（含终态）收窄到推进阶段，避免到处写 `as`。 */
+export function isOpenStage(stage: string): stage is OpenStage {
+  return (OPEN_STAGES as readonly string[]).includes(stage);
+}
 
 export function isTerminalStage(stage: string): boolean {
   return stage === "won" || stage === "lost";
@@ -61,8 +74,15 @@ export function formatAmount(value: string | null | undefined): string {
   });
 }
 
-/** 日期在 wire 上是 ISO 日期/时间串；只取年月日展示，空值给破折号。 */
-export function formatDate(value: string | null | undefined): string {
+/**
+ * 只取日期列（`date`）的年月日，空值给破折号。
+ *
+ * **仅用于 `date` 列**（如 `expected_close_date`）：`slice(0, 10)` 对纯日期是恒等
+ * 操作。`datetime` 列（`won_at` / `created_at` / `updated_at`）是带偏移的 ISO 串，
+ * 直接截前 10 位拿到的是 **UTC** 日期——CST 凌晨 0–8 点的事件会显示成前一天。
+ * 格式化 datetime 必须先按 `Asia/Shanghai` 换算再取日期，不要复用本函数。
+ */
+export function formatDateOnly(value: string | null | undefined): string {
   if (!value) return "—";
   return value.slice(0, 10);
 }

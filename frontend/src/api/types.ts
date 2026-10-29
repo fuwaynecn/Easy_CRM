@@ -66,13 +66,17 @@ export interface LostReason {
   active: boolean;
 }
 
-export type OpportunityStage =
-  | "contact"
-  | "needs"
-  | "proposal"
-  | "negotiation"
-  | "won"
-  | "lost";
+/**
+ * 推进阶段：**新建机会时唯一允许提交的四个阶段**。
+ *
+ * 单独定义而不是从 `constants/opportunityLabels.ts` 反推，是为了不让 `types.ts`
+ * 依赖 constants（那会形成 types ← constants ← types 的循环）。`OPEN_STAGES`
+ * 在常量侧以 `readonly OpenStage[]` 标注，两边漂移会被 tsc 挡住。
+ */
+export type OpenStage = "contact" | "needs" | "proposal" | "negotiation";
+
+/** 全部六个阶段：四个推进阶段 + 两个终态。 */
+export type OpportunityStage = OpenStage | "won" | "lost";
 
 export interface Opportunity {
   id: number;

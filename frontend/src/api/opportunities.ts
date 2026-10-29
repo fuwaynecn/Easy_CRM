@@ -13,7 +13,7 @@
  */
 
 import { api } from "./client";
-import type { Board, LostReason, Opportunity, Page } from "./types";
+import type { Board, LostReason, OpenStage, Opportunity, Page } from "./types";
 
 export interface OpportunityListParams {
   keyword?: string;
@@ -43,7 +43,7 @@ export interface OpportunityCreateBody {
   customer_id: number;
   name: string;
   /** 新建只允许四个推进阶段；传 won/lost 后端 400。 */
-  stage?: string;
+  stage?: OpenStage;
   amount?: string;
   expected_close_date?: string | null;
   competitor?: string | null;
