@@ -2,7 +2,8 @@ import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
 import { loginRequest, logoutRequest, meRequest } from "../api/auth";
-import { setAccessToken, tryRefresh } from "../api/client";
+import type { LoginResult } from "../api/auth";
+import { ApiError, setAccessToken, setSessionExpiredHandler, tryRefresh } from "../api/client";
 import type { User } from "../api/types";
 
 interface AuthState {
@@ -14,9 +15,30 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState | null>(null);
 
+/** 后端返回 200 但结构不对时，不能直接信任类型断言的结果。 */
+function isLoginResult(value: unknown): value is LoginResult {
+  if (typeof value !== "object" || value === null) return false;
+  const body = value as { access_token?: unknown; user?: unknown };
+  if (typeof body.access_token !== "string") return false;
+  const user = body.user;
+  if (typeof user !== "object" || user === null) return false;
+  return typeof (user as { id?: unknown }).id === "number";
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // 会话彻底失效（刷新失败、或刷新后重试仍 401）时清掉本地登录态，
+  // 让 RequireAuth 把用户送回登录页。回调内不发请求，避免递归触发。
+  useEffect(() => {
+    setSessionExpiredHandler(() => {
+      setUser(null);
+    });
+    return () => {
+      setSessionExpiredHandler(null);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -27,6 +49,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const me = await meRequest();
           if (!cancelled) setUser(me);
         } catch {
+          // 读取当前用户失败即视为未登录：token 一并清掉，失败即清干净。
+          setAccessToken(null);
           if (!cancelled) setUser(null);
         }
       }
@@ -42,14 +66,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       loading,
       async login(username: string, password: string) {
-        const result = await loginRequest(username, password);
+        const result: unknown = await loginRequest(username, password);
+        if (!isLoginResult(result)) {
+          setAccessToken(null);
+          setUser(null);
+          throw new ApiError(500, "invalid_response", "登录响应异常，请稍后重试");
+        }
         setAccessToken(result.access_token);
         setUser(result.user);
       },
       async logout() {
-        await logoutRequest().catch(() => undefined);
+        // 先清本地状态再通知后端：后端无响应时用户也必须能退出。
         setAccessToken(null);
         setUser(null);
+        void logoutRequest().catch(() => undefined);
       },
     }),
     [user, loading],

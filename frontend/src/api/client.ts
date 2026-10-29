@@ -8,6 +8,16 @@ export function getAccessToken(): string | null {
   return accessToken;
 }
 
+/**
+ * “会话彻底失效”回调：仅在上层状态需要同步清理时使用。
+ * 回调内不得再发起请求（会再次触发本回调，形成递归）。
+ */
+let onSessionExpired: (() => void) | null = null;
+
+export function setSessionExpiredHandler(handler: (() => void) | null): void {
+  onSessionExpired = handler;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -31,6 +41,7 @@ export function tryRefresh(): Promise<boolean> {
       .then(async (resp) => {
         if (!resp.ok) {
           setAccessToken(null);
+          onSessionExpired?.();
           return false;
         }
         const data = (await resp.json()) as { access_token?: unknown };
@@ -43,6 +54,7 @@ export function tryRefresh(): Promise<boolean> {
       })
       .catch(() => {
         setAccessToken(null);
+        onSessionExpired?.();
         return false;
       })
       .finally(() => {
@@ -65,9 +77,18 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     });
 
   let resp = await send();
+  let retriedAfterUnauthorized = false;
   if (resp.status === 401 && accessToken) {
     const ok = await tryRefresh();
-    if (ok) resp = await send();
+    if (ok) {
+      resp = await send();
+      retriedAfterUnauthorized = true;
+    }
+  }
+  // 刷新成功但重试仍 401：会话已失效，通知上层清理。
+  // 没有 token 的 401（例如登录密码错误）不走这里，避免误报会话过期。
+  if (retriedAfterUnauthorized && resp.status === 401) {
+    onSessionExpired?.();
   }
   if (resp.status === 204) return undefined as T;
 
