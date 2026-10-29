@@ -10,6 +10,7 @@
 """
 
 import re
+import unicodedata
 from datetime import UTC, datetime
 
 from sqlalchemy import Select, func, or_, select
@@ -60,8 +61,14 @@ _REQUIRED_FIELDS = {
 
 
 def normalize_name(name: str) -> str:
-    """去噪声字符并转小写，供软查重比较（design §4.4）。"""
-    return _NOISE.sub("", name).lower()
+    """宽度归一化后去噪声字符并转小写，供软查重比较（design §4.4）。
+
+    先做 NFKC 而不是直接 ``strip().lower()``：Excel 导出的客户名里全角字母数字极
+    常见（"杭州ＸＸ公司" vs "杭州XX公司"），不归一化就会被判成两家不同客户，软查重
+    等于漏掉最常见的一类重复。NFKC 顺带把全角空格、全角括号折成半角，正好落进
+    ``_NOISE`` 的清理范围。
+    """
+    return _NOISE.sub("", unicodedata.normalize("NFKC", name)).lower()
 
 
 def find_similar_customers(db: Session, name: str, limit: int = 5) -> list[Customer]:
@@ -174,6 +181,13 @@ def create_customer(db: Session, actor: User, payload: CustomerCreate) -> Custom
             )
 
     owner = _resolve_owner(db, actor, payload.owner_id)
+    # 负责人必须有部门：department_id 只能从 owner 同步（下面那行），owner 没部门就
+    # 只能落成 NULL，于是这条客户既不在公海、也不在任何部门作用域里——owner 自己
+    # 都看不到，库里留下一条"谁都看不见"的孤儿行。无部门主管自建（None != None 放行）
+    # 与管理员把客户指定给无部门账号（如另一个 admin）都走这条路径，所以判在这里，
+    # 而不是分散在 _resolve_owner 的两个分支里。
+    if owner is not None and owner.department_id is None:
+        raise InvalidValueError("负责人未分配部门，无法归属客户")
     customer = Customer(
         name=name,
         short_name=payload.short_name,

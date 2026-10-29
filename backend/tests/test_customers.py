@@ -96,12 +96,36 @@ def _setup(db):
     }
 
 
+def _orphan_customers(db):
+    """孤儿客户：有负责人但没有部门。
+
+    这类客户不在公海、也不在任何部门作用域里，owner 自己都看不到；创建路径
+    一旦放行就会留下这种"谁都看不见"的行，因此测试直接查库断言它们为零。
+    """
+    return (
+        db.execute(
+            select(Customer).where(
+                Customer.owner_id.is_not(None), Customer.department_id.is_(None)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 # --- 名称归一化 ---------------------------------------------------------
 
 
 def test_normalize_name_strips_noise():
     assert normalize_name("  浙江 甲（制造）有限公司 ") == "浙江甲制造有限公司"
     assert normalize_name("ABC Co.,Ltd.") == "abccoltd"
+
+
+def test_normalize_name_normalizes_character_width():
+    """Excel 导出里全角字母数字极常见，宽度不同的同一个名字必须归一。"""
+    assert normalize_name("杭州ＸＸ智能装备有限公司") == "杭州xx智能装备有限公司"
+    assert normalize_name("　浙江 甲（制造）有限公司　") == "浙江甲制造有限公司"
+    assert normalize_name("ＡＢＣ 有限公司") == normalize_name("ABC 有限公司")
 
 
 # --- 创建：归属与冗余字段 -----------------------------------------------
@@ -191,6 +215,55 @@ def test_sales_cannot_create_for_someone_else(db):
     assert db.execute(select(Customer)).scalars().all() == []
 
 
+def test_manager_without_department_cannot_create_customer(db):
+    """无部门主管建客户会造出"owner 有值、department 为空"的孤儿行。
+
+    这类客户既不在公海、也不在任何部门作用域里，连 owner 自己都看不到；
+    ``None != None`` 放行是根因，必须 400 拒绝而不是静默落库。
+    """
+    _setup(db)
+    void = create_user(
+        db,
+        username="boss_void",
+        password=PASSWORD,
+        display_name="无部门主管",
+        role=ROLE_MANAGER,
+        department_id=None,
+    )
+
+    with pytest.raises(InvalidValueError) as exc:
+        create_customer(db, void, CustomerCreate(name="甲公司"))
+
+    assert exc.value.status_code == 400
+    assert exc.value.message == "负责人未分配部门，无法归属客户"
+    db.expire_all()
+    assert db.execute(select(Customer)).scalars().all() == []
+    assert _orphan_customers(db) == []
+
+
+def test_admin_cannot_assign_owner_without_department(db):
+    """同一个洞的另一条入口：管理员把客户指定给无部门账号（如另一个 admin）。"""
+    f = _setup(db)
+    void = create_user(
+        db,
+        username="it_support",
+        password=PASSWORD,
+        display_name="IT 支持",
+        role=ROLE_ADMIN,
+        department_id=None,
+    )
+
+    with pytest.raises(InvalidValueError) as exc:
+        create_customer(
+            db, f["admin"], CustomerCreate(name="甲公司", owner_id=void.id)
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.message == "负责人未分配部门，无法归属客户"
+    db.expire_all()
+    assert _orphan_customers(db) == []
+
+
 def test_create_rejects_unknown_owner(db):
     f = _setup(db)
 
@@ -227,6 +300,20 @@ def test_create_customer_rejects_similar_name(db):
         "id": existing.id,
         "name": "浙江甲制造有限公司",
     }
+
+
+def test_create_customer_rejects_full_width_duplicate(db):
+    """同一家公司的全角/半角两种写法必须命中同一条重名 409，不能当成两家客户。"""
+    f = _setup(db)
+    existing = create_customer(
+        db, f["sa"], CustomerCreate(name="杭州ＸＸ智能装备有限公司")
+    )
+
+    with pytest.raises(ConflictError) as exc:
+        create_customer(db, f["sa"], CustomerCreate(name="杭州XX智能装备有限公司"))
+
+    assert exc.value.status_code == 409
+    assert [item["id"] for item in exc.value.detail["similar"]] == [existing.id]
 
 
 def test_duplicate_check_is_cross_scope(db):
