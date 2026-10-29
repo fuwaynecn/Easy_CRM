@@ -49,6 +49,15 @@ function useDesktopDragEnabled(): boolean {
  * 要么在失败后"先跳过去再弹回来"，用户会以为已经成功了；这里失败时卡片根本没动，
  * 只在顶部出一条错误，语义与事实一致。成功后才 invalidate `["board"]` 重新取数
  * （Task 8 的列表页在推进成功后也 invalidate 这个键，两页数据因此始终一致）。
+ *
+ * 一次移动请求在飞时，**所有卡片与列一起暂停接收拖拽**，顶部同时显示"正在移动到…"。
+ * 之所以整体暂停而不是只挡同一张卡：后端对"同一阶段再提交"是 400，但两个**不同**
+ * 机会的并发变更虽然都合法，请求回来的顺序却不保证，两次 invalidate 交错时看板会
+ * 短暂显示一半新一半旧；何况本页刻意不做乐观移动，卡片必须等服务端确认才换列，
+ * 并发的第二张卡在界面上同样"拖了没反应"。整体暂停 + 可见进度条是唯一能让用户
+ * 一眼看出"系统正在处理上一次操作"的做法，也只需要一个 `isPending` 真值源。
+ * （按 id 记在飞集合要多一份 Set 状态与逐卡 loading 标记，收益只是"能排队的第二
+ * 次拖拽"，而本页一次变更通常一秒内就回来。）
  */
 export default function OpportunityBoardPage() {
   const queryClient = useQueryClient();
@@ -76,6 +85,10 @@ export default function OpportunityBoardPage() {
     },
   });
 
+  // 请求在飞期间整体冻结拖拽入口（见组件头）。卡片与列都看这个真值源，
+  // 不存在"卡片还能拖、列却拒收"这种一半可用的中间态。
+  const canDrag = dragEnabled && !move.isPending;
+
   /**
    * 落点处理：需要额外输入的先弹窗，其余直接提交。
    *
@@ -85,9 +98,13 @@ export default function OpportunityBoardPage() {
     const opportunity = dragging;
     setDragging(null);
     setDragOverStage(null);
-    setLocalError(null);
-    // 同一单的提交还没回来时再放一次，第二个请求必然是 400「机会已处于该阶段」
+    // 上一次移动还没回来：绝不再发第二个请求（第二个必然 400「机会已处于该阶段」，
+    // 而且会与第一次的 invalidate 抢着刷新看板）。正常路径上它不可达——`canDrag`
+    // 已经让卡片与列都拒绝拖拽——留在这里只是兜底，防止将来新增的入口绕过 `canDrag`。
     if (move.isPending) return;
+    // 每个新落点都从干净状态开始：上一次请求留下的红字不能遮住这一次的本地拦截文案。
+    move.reset();
+    setLocalError(null);
     if (opportunity === null) return;
     // 同阶段后端 400，本就不该发请求
     if (opportunity.stage === targetStage) return;
@@ -124,8 +141,10 @@ export default function OpportunityBoardPage() {
 
   const columns = query.data?.columns ?? [];
   const allEmpty = columns.length > 0 && columns.every((column) => column.total === 0);
-  // 阶段变更的两条失败来源：本次请求被后端拒绝，或被前端提前拦下的非法落点
-  const errorText = move.isError ? errorMessage(move.error, "阶段变更失败，请重试") : localError;
+  // 阶段变更的两条失败来源：本次请求被后端拒绝，或被前端提前拦下的非法落点。
+  // 本地拦截优先：用户刚做的动作是"拖到一个不允许的列"，只该看到这条解释；
+  // 上一次请求的错误已在 handleDrop 起始 reset 掉，这里再取一次优先级是双保险。
+  const errorText = localError ?? (move.isError ? errorMessage(move.error, "阶段变更失败，请重试") : null);
 
   return (
     <div className="space-y-3">
@@ -138,9 +157,17 @@ export default function OpportunityBoardPage() {
           列表视图
         </Link>
         <p className="w-full text-xs text-slate-500 sm:w-auto">
-          桌面可直接拖动卡片改阶段；手机上点卡片选阶段。落位后由服务端确认，失败会自动回到原列。
+          桌面可直接拖动卡片改阶段；手机上点卡片选阶段。落位后由服务端确认，成功后才换列，失败时卡片留在原列。
         </p>
       </div>
+
+      {/* 在飞期间唯一可见的"系统正在处理"信号（配合全局禁用拖拽）。
+          role="status" 让读屏用户也听得到，而不只是靠"拖不动"去猜。 */}
+      {move.isPending ? (
+        <p role="status" className="text-sm text-slate-600">
+          正在移动到「{STAGE_LABELS[move.variables?.stage ?? ""] ?? "目标阶段"}」…
+        </p>
+      ) : null}
 
       {errorText ? <p className="break-words text-sm text-red-600">{errorText}</p> : null}
 
@@ -166,6 +193,9 @@ export default function OpportunityBoardPage() {
           <section
             key={column.stage}
             onDragOver={(event) => {
+              // 请求在飞时不接受放置：不 preventDefault，浏览器就不会把这一列
+              // 当成合法落点（否则会出现"高亮了却什么都没发生"）。
+              if (!canDrag) return;
               // 不 preventDefault 的话浏览器认为这一列不可放置，drop 根本不会触发
               event.preventDefault();
               event.dataTransfer.dropEffect = "move";
@@ -175,6 +205,7 @@ export default function OpportunityBoardPage() {
             // 高亮会闪。dragover 连续触发会把高亮带到新列，dragEnd 负责收尾清空。
             onDrop={(event) => {
               event.preventDefault();
+              if (!canDrag) return;
               handleDrop(column.stage);
             }}
             className={`flex min-w-[240px] flex-1 flex-col gap-2 rounded-lg border p-2 ${
@@ -200,8 +231,10 @@ export default function OpportunityBoardPage() {
             {column.items.map((item) => (
               <article
                 key={item.id}
-                // 窄屏不给 draggable：触屏上"长按拖动"与滚动抢手势（见 hook 注释）
-                draggable={dragEnabled}
+                // 窄屏不给 draggable：触屏上"长按拖动"与滚动抢手势（见 hook 注释）。
+                // 在飞期间也关掉：与其让用户拖完发现被静默忽略，不如一开始就拖不动，
+                // 顶部同时有"正在移动…"，"不能拖"是有解释的。
+                draggable={canDrag}
                 onDragStart={(event) => {
                   // 写一个 text/plain 只是为了让 Firefox 认这次拖拽；真正的数据在 state 里
                   event.dataTransfer.setData("text/plain", String(item.id));
@@ -216,6 +249,10 @@ export default function OpportunityBoardPage() {
                 onClick={() => {
                   // 300ms 内刚结束一次拖拽：这次 click 是拖拽的副产物，不弹窗
                   if (Date.now() - dragEndedAt.current < 300) return;
+                  // 打开弹窗前清掉看板上的旧错误，否则上一次请求的红字会留在页面上，
+                  // 与弹窗里这一次的输入毫无关系。**在飞时不 reset**：reset 会把
+                  // `isPending` 清成 false，正好放行一次本不该并发的拖拽。
+                  if (!move.isPending) move.reset();
                   setLocalError(null);
                   setModal({ opportunity: item, stage: item.stage });
                 }}
@@ -239,7 +276,7 @@ export default function OpportunityBoardPage() {
             {/* 空列留一块看得见、接得住拖拽的落点，而不是一片空白让人以为不能放 */}
             {column.items.length === 0 ? (
               <p className="flex flex-1 items-center justify-center rounded-md border border-dashed border-slate-300 px-2 py-6 text-center text-xs text-slate-400">
-                {dragEnabled ? "暂无机会，可拖到这里" : "暂无机会"}
+                {canDrag ? "暂无机会，可拖到这里" : "暂无机会"}
               </p>
             ) : null}
 
