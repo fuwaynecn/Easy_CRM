@@ -77,14 +77,14 @@ PostgreSQL 16，字符集 UTF-8。所有表带 `created_at`、`updated_at`（UTC
 |---|---|---|
 | id | bigserial PK | |
 | username | varchar(64) unique not null | 登录名 |
-| password_hash | varchar(255) not null | bcrypt |
+| password_hash | varchar(255) not null | Argon2id（`pwdlib` recommended，m=64MiB, t=3, p=4） |
 | display_name | varchar(64) not null | 姓名 |
 | role | varchar(16) not null | `admin` / `manager` / `sales` |
 | department_id | bigint FK departments | `admin` 可为空 |
 | status | varchar(16) not null default 'active' | `active` / `disabled` |
 | last_login_at | timestamptz | |
 
-登录失败策略：同一账号连续 5 次失败锁定 15 分钟，锁定状态记在缓存中，不落库。
+登录失败策略：同一账号连续 5 次失败锁定 15 分钟，锁定状态**落库**（`users.failed_login_count` / `users.locked_until`），不记进程内缓存：线上跑 2 个 uvicorn worker，进程内计数不共享，记在缓存会变成"每个 worker 各自数 5 次"。
 
 ### 3.3 customers
 
@@ -99,7 +99,7 @@ PostgreSQL 16，字符集 UTF-8。所有表带 `created_at`、`updated_at`（UTC
 | address | varchar(255) | 地址 |
 | website | varchar(255) | 官网 |
 | scale | varchar(32) | 规模 |
-| level | varchar(4) | `A` / `B` / `C`，默认 `C` |
+| level | varchar(4) not null default 'C' | `A` / `B` / `C`，默认 `C` |
 | source | varchar(64) | 来源渠道 |
 | procurement_type | varchar(16) | 采购方式：`tender` 招标 / `direct` 直采 / `framework` 框架协议 / `other` 其他，可空 |
 | budget_status | varchar(16) not null default 'unknown' | 预算状态：`approved` 已立项 / `pending` 预算未批 / `none` 无预算 / `unknown` 未知 |
@@ -110,7 +110,7 @@ PostgreSQL 16，字符集 UTF-8。所有表带 `created_at`、`updated_at`（UTC
 | remark | text | |
 | created_by | bigint FK users | |
 
-索引：`(owner_id)`、`(department_id)`、`(last_activity_at)`、`lower(name) varchar_pattern_ops`（重名查询）、`(status)`。
+索引：`(owner_id)`、`(department_id)`、`(last_activity_at)`、`(status)`、`(name)`。`lower(name) varchar_pattern_ops`（重名查询）在 P1 **不建**：P1 没有前缀 LIKE 查询，重名查重走应用层软查重（Python 侧 `lower(name)` 比较）；如将来要建，必须显式命名——`ix` 命名模板对函数索引会与普通列索引撞名。
 
 **不设 `name` 唯一约束。** 现实中有“XX 集团”与“XX 集团分公司”这类同名不同实体。改为创建时软查重（见 4.4）。
 
