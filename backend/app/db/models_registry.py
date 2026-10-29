@@ -6,4 +6,5 @@
 from app.modules.contacts.models import Contact  # noqa: F401
 from app.modules.customers.models import Customer  # noqa: F401
 from app.modules.departments.models import Department  # noqa: F401
+from app.modules.lost_reasons.models import LostReason  # noqa: F401
 from app.modules.users.models import User  # noqa: F401

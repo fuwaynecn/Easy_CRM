@@ -29,6 +29,8 @@ from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.models import Department
 from app.modules.departments.service import create_department
+from app.modules.lost_reasons.schemas import LostReasonCreate
+from app.modules.lost_reasons.service import create_lost_reason, list_lost_reasons
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
 from app.modules.users.service import create_user, get_user_by_username
 
@@ -36,6 +38,17 @@ from app.modules.users.service import create_user, get_user_by_username
 SEED_PASSWORD = "Passw0rd!"
 
 DEPARTMENTS = ("华东销售部", "华南销售部")
+
+# design §3.10「初始数据」逐字照抄：顺序就是下拉框顺序。改这里等于改产品口径。
+LOST_REASONS = (
+    "价格过高",
+    "交期不满足",
+    "技术方案不匹配",
+    "客户预算取消",
+    "客户选择了竞品",
+    "项目延期搁置",
+    "其他",
+)
 
 
 @dataclass(frozen=True)
@@ -158,6 +171,26 @@ CUSTOMERS = (
 )
 
 
+def _seed_lost_reasons(db: Session) -> tuple[int, list[str], list[str]]:
+    """按名称判重播种输单原因，返回（新建数、新建明细、跳过明细）。
+
+    已存在的条目**不改**它的 `sort_order` / `active`：管理员停用过的条目不能被种子
+    脚本悄悄打开，那等于每次跑种子都覆盖一次人工裁定。
+    """
+    existing = {reason.name for reason in list_lost_reasons(db, include_inactive=True)}
+    created: list[str] = []
+    skipped: list[str] = []
+    for index, name in enumerate(LOST_REASONS):
+        if name in existing:
+            skipped.append(name)
+            continue
+        create_lost_reason(
+            db, LostReasonCreate(name=name, sort_order=index * 10)
+        )
+        created.append(name)
+    return len(created), created, skipped
+
+
 def _get_or_create_department(db: Session, name: str) -> tuple[Department, int]:
     existing = db.execute(
         select(Department).where(Department.name == name)
@@ -265,13 +298,24 @@ def _seed(
     db: Session,
 ) -> tuple[dict[str, int], dict[str, list[str]], dict[str, list[str]]]:
     """真正的播种逻辑：返回（各表新建数量、新建明细、跳过明细）。"""
-    counts = {"departments": 0, "users": 0, "customers": 0, "contacts": 0}
+    counts = {
+        "departments": 0,
+        "users": 0,
+        "customers": 0,
+        "contacts": 0,
+        "lost_reasons": 0,
+    }
     created: dict[str, list[str]] = {key: [] for key in counts}
     skipped: dict[str, list[str]] = {key: [] for key in counts}
 
     def _record(key: str, label: str, was_created: int) -> None:
         counts[key] += was_created
         (created if was_created else skipped)[key].append(label)
+
+    reason_count, reason_created, reason_skipped = _seed_lost_reasons(db)
+    counts["lost_reasons"] = reason_count
+    created["lost_reasons"] = reason_created
+    skipped["lost_reasons"] = reason_skipped
 
     departments: dict[str, Department] = {}
     for name in DEPARTMENTS:
@@ -311,6 +355,7 @@ _LABELS = {
     "users": "用户",
     "customers": "客户",
     "contacts": "联系人",
+    "lost_reasons": "输单原因",
 }
 
 _ROLE_LABELS = {ROLE_ADMIN: "管理员", ROLE_MANAGER: "主管", ROLE_SALES: "销售"}

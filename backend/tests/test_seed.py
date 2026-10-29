@@ -20,8 +20,9 @@ from app.core.security import verify_password
 from app.modules.contacts.models import Contact
 from app.modules.customers.models import Customer
 from app.modules.departments.models import Department
+from app.modules.lost_reasons.models import LostReason
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
-from scripts.seed import SEED_PASSWORD, main, seed
+from scripts.seed import LOST_REASONS, SEED_PASSWORD, main, seed
 
 
 def _count(db, model) -> int:
@@ -34,6 +35,7 @@ def _counts(db) -> dict[str, int]:
         "users": _count(db, User),
         "customers": _count(db, Customer),
         "contacts": _count(db, Contact),
+        "lost_reasons": _count(db, LostReason),
     }
 
 
@@ -49,6 +51,7 @@ def test_entry_point_refuses_non_dev_environment(db, monkeypatch, capsys):
         "users": 0,
         "customers": 0,
         "contacts": 0,
+        "lost_reasons": 0,
     }
     output = capsys.readouterr()
     assert "production" in output.err
@@ -64,6 +67,7 @@ def test_seed_creates_baseline_data(db):
     assert result["users"] >= 4
     assert result["customers"] >= 3
     assert result["contacts"] >= 2
+    assert result["lost_reasons"] == len(LOST_REASONS)
 
 
 def test_seed_is_idempotent(db):
@@ -73,7 +77,13 @@ def test_seed_is_idempotent(db):
 
     result = seed(db)
 
-    assert result == {"departments": 0, "users": 0, "customers": 0, "contacts": 0}
+    assert result == {
+        "departments": 0,
+        "users": 0,
+        "customers": 0,
+        "contacts": 0,
+        "lost_reasons": 0,
+    }
     assert _counts(db) == before
 
 
