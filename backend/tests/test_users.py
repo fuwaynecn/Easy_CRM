@@ -2,6 +2,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import text
 
 from app.core.errors import (
     ConflictError,
@@ -326,3 +327,24 @@ def test_reset_password_changes_hash(db):
 def test_reset_password_missing_user_raises(db):
     with pytest.raises(NotFoundError):
         reset_password(db, 9999, "NewPass!23")
+
+
+def test_status_and_failed_login_count_have_server_defaults(db):
+    """裸 INSERT 不带 status / failed_login_count 时必须能成功。
+
+    这两个字段原来只有 Python 侧 default：ORM 之外的写入（Excel 导入、运维手工
+    插入）会直接撞 NOT NULL 约束。
+    """
+    db.execute(
+        text(
+            "INSERT INTO users (username, password_hash, display_name, role) "
+            "VALUES ('rawimport', 'x', '裸插用户', 'sales')"
+        )
+    )
+    db.commit()
+
+    row = db.execute(
+        text("SELECT status, failed_login_count FROM users WHERE username = 'rawimport'")
+    ).one()
+    assert row.status == "active"
+    assert row.failed_login_count == 0

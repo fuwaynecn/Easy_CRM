@@ -350,3 +350,15 @@ def test_departments_create_forbids_manager(client, db):
         "/api/v1/departments", json={"name": "华南销售部"}, headers=_bearer(token)
     )
     assert resp.status_code == 403
+
+
+def test_departments_create_duplicate_name_returns_409(client, db):
+    """重名走真实 HTTP：409 + 统一错误体（原先只有 service 层的间接证据）。"""
+    _make_user(db, username="admin1", role=ROLE_ADMIN, dept_name="华东销售部")
+    token = _login(client, username="admin1").json()["access_token"]
+    resp = client.post(
+        "/api/v1/departments", json={"name": "华东销售部"}, headers=_bearer(token)
+    )
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "conflict"
+    assert "已存在" in resp.json()["message"]

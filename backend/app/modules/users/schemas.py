@@ -25,8 +25,17 @@ class UserRead(BaseModel):
     created_at: datetime
 
 
-class UserStatusUpdate(BaseModel):
-    status: str
+class UserUpdate(BaseModel):
+    """部分更新：只处理实际提交的字段。
+
+    department_id 显式传 null 表示"清空部门"，因此不能只看值是否为 None；
+    路由用 model_dump(exclude_unset=True) 区分"没提交"与"提交了 null"。
+    """
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=64)
+    role: str | None = None
+    department_id: int | None = None
+    status: str | None = None
 
 
 class PasswordReset(BaseModel):

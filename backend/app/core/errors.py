@@ -52,6 +52,16 @@ class WeakPasswordError(AppError):
     code = "weak_password"
 
 
+class InvalidValueError(AppError):
+    """取值不在允许集合内（角色、账号状态等）：400。
+
+    与 409 区分：409 表示与现有数据冲突（重名、已存在），取值非法并不是冲突。
+    """
+
+    status_code = 400
+    code = "invalid_value"
+
+
 class ConflictError(AppError):
     status_code = 409
     code = "conflict"
