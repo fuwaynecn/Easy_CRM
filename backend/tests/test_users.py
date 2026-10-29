@@ -344,7 +344,12 @@ def test_status_and_failed_login_count_have_server_defaults(db):
     db.commit()
 
     row = db.execute(
-        text("SELECT status, failed_login_count FROM users WHERE username = 'rawimport'")
+        text(
+            "SELECT status, failed_login_count, created_at, updated_at "
+            "FROM users WHERE username = 'rawimport'"
+        )
     ).one()
     assert row.status == "active"
     assert row.failed_login_count == 0
+    assert row.created_at is not None
+    assert row.updated_at is not None

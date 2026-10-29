@@ -14,7 +14,9 @@ class Page[T](BaseModel):
 class PageParams:
     def __init__(
         self,
-        page: Annotated[int, Query(ge=1)] = 1,
+        # 上界防 OFFSET 溢出 bigint：(page-1)*page_size 超过 2^63-1 时 PG 会报错，
+        # 把一次参数错误变成 500。10 万页对几百人的内部系统远超需求。
+        page: Annotated[int, Query(ge=1, le=100_000)] = 1,
         page_size: Annotated[int, Query(ge=1, le=200)] = 20,
     ) -> None:
         self.page = page

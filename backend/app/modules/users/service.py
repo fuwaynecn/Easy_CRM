@@ -47,6 +47,8 @@ __all__ = [
 INVALID_CREDENTIALS_MESSAGE = "用户名或密码错误"
 
 MIN_PASSWORD_LENGTH = 8
+MIN_USERNAME_LENGTH = 3
+MAX_USERNAME_LENGTH = 64
 
 # update_user 认的字段。路由用 model_dump(exclude_unset=True) 只传提交过的键。
 UPDATABLE_FIELDS = ("display_name", "role", "department_id", "status")
@@ -127,6 +129,17 @@ def create_user(
     department_id: int | None,
 ) -> User:
     cleaned_username = username.strip()
+    # schema 的长度约束跑在 strip 之前："  a  " 长度 5 能过 min_length=3，
+    # strip 后却只剩 1 个字符。非空与最终长度必须在 strip 之后再校验一次。
+    if not cleaned_username:
+        raise InvalidValueError("登录名不能为空")
+    if not MIN_USERNAME_LENGTH <= len(cleaned_username) <= MAX_USERNAME_LENGTH:
+        raise InvalidValueError(
+            f"登录名长度必须在 {MIN_USERNAME_LENGTH}-{MAX_USERNAME_LENGTH} 位之间"
+        )
+    cleaned_display_name = display_name.strip()
+    if not cleaned_display_name:
+        raise InvalidValueError("显示名不能为空")
     _validate_password(password)
     _validate_role(role)
     _ensure_department_exists(db, department_id)
@@ -135,7 +148,7 @@ def create_user(
     user = User(
         username=cleaned_username,
         password_hash=hash_password(password),
-        display_name=display_name.strip(),
+        display_name=cleaned_display_name,
         role=role,
         department_id=department_id,
     )
@@ -235,6 +248,12 @@ def update_user(db: Session, user_id: int, changes: dict[str, Any]) -> User:
 
 
 def reset_password(db: Session, user_id: int, new_password: str) -> User:
+    """管理员重置口令。
+
+    口径（评审裁定）：只清 ``failed_login_count`` 与 ``locked_until``，**不解除
+    disabled**。停用是独立的管理动作，重置口令顺带把账号恢复成 active 等于意外
+    提权；需要恢复时必须再调一次 update_user(status="active")。
+    """
     user = db.get(User, user_id)
     if user is None:
         raise NotFoundError("用户不存在")

@@ -1,5 +1,5 @@
 import pytest
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.modules.customers.models import (
@@ -39,14 +39,35 @@ def test_customer_nullable_fields_accept_none(db):
     assert stored.department_id is None
 
 
-def test_customer_name_indexed_for_lower_lookup(db):
-    # 索引存在性是迁移层面的保证，这里确认列可正常按小写查询
-    db.add(Customer(name="HangZhou Tech", created_by=None))
+def test_customer_indexes_exist(db):
+    """五条索引必须真实存在：迁移/建表漏建时这里直接红。"""
+    names = {index["name"] for index in inspect(db.get_bind()).get_indexes("customers")}
+
+    assert {
+        "ix_customers_owner_id",
+        "ix_customers_department_id",
+        "ix_customers_last_activity_at",
+        "ix_customers_status",
+        "ix_customers_name",
+    } <= names
+
+
+def test_customer_server_defaults_apply_on_raw_insert(db):
+    """裸 INSERT 不给默认列：必须由数据库自己填上 level/status/budget_status。"""
+    db.execute(text("INSERT INTO customers (name) VALUES ('裸插客户')"))
     db.commit()
-    found = db.execute(
-        select(Customer).where(Customer.name == "HangZhou Tech")
-    ).scalar_one()
-    assert found.name == "HangZhou Tech"
+
+    row = db.execute(
+        text(
+            "SELECT level, status, budget_status, created_at, updated_at "
+            "FROM customers WHERE name = '裸插客户'"
+        )
+    ).one()
+    assert row.level == "C"
+    assert row.status == "active"
+    assert row.budget_status == "unknown"
+    assert row.created_at is not None
+    assert row.updated_at is not None
 
 
 def test_customer_name_is_required(db):

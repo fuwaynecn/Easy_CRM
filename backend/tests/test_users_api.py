@@ -154,7 +154,9 @@ def test_list_users_paginates(client, db):
 
 
 @pytest.mark.parametrize(
-    "params", [{"page": 0}, {"page_size": 0}, {"page_size": 201}]
+    "params",
+    [{"page": 0}, {"page": 999_999_999}, {"page_size": 0}, {"page_size": 201}],
+    ids=["page-zero", "page-too-large", "page-size-zero", "page-size-too-large"],
 )
 def test_list_users_rejects_invalid_paging(client, db, params):
     _bootstrap(db)
@@ -196,6 +198,22 @@ def test_admin_can_create_user(client, db):
     assert body["role"] == ROLE_SALES
     assert body["department_id"] == dept_id
     assert body["status"] == "active"
+
+
+def test_create_rejects_internal_fields(client, db):
+    """创建 schema 也必须拒绝未知字段：password_hash 被静默丢弃会让人以为写入了。"""
+    _admin(db)
+    headers = _auth(_token(client, "admin"))
+
+    resp = client.post(
+        "/api/v1/users",
+        headers=headers,
+        json=_new_user_payload(password_hash="deadbeef"),
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "validation_error"
+    assert get_user_by_username(db, "sales2") is None
 
 
 def test_created_user_can_login_with_real_password(client, db):
@@ -241,6 +259,29 @@ def test_username_is_stripped_on_create_and_login(client, db):
             "/api/v1/auth/login", json={"username": username, "password": PASSWORD}
         )
         assert login.status_code == 200, f"{username!r} 登录失败：{login.text}"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("username", "  a  "), ("display_name", "   ")],
+    ids=["username-after-strip", "display-name-blank"],
+)
+def test_create_validates_after_strip(client, db, field, value):
+    """strip 之后的最终值才参与非空/长度校验，不能存出 1 字符登录名或空显示名。"""
+    _admin(db)
+    headers = _auth(_token(client, "admin"))
+
+    resp = client.post(
+        "/api/v1/users",
+        headers=headers,
+        json=_new_user_payload(**{field: value}),
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_value"
+    db.expire_all()
+    assert get_user_by_username(db, "sales2") is None
+    assert get_user_by_username(db, "a") is None
 
 
 def test_weak_password_returns_400_without_echo(client, db):
@@ -364,6 +405,10 @@ def test_update_without_a_field_keeps_it(client, db):
     _admin(db)
     target = _sales(db)
     headers = _auth(_token(client, "admin"))
+    # 在请求前把期望值抄成普通整数：若只和同一个 ORM 对象比较，
+    # 请求共用的 Session 会把 target 一起改掉，断言就恒真了。
+    assert target.department_id is not None
+    expected_department_id = target.department_id
 
     resp = client.patch(
         f"/api/v1/users/{target.id}", headers=headers, json={"display_name": "新名字"}
@@ -374,7 +419,27 @@ def test_update_without_a_field_keeps_it(client, db):
     assert body["display_name"] == "新名字"
     assert body["role"] == ROLE_SALES
     assert body["status"] == "active"
-    assert body["department_id"] == target.department_id
+    assert body["department_id"] == expected_department_id
+
+
+def test_patch_rejects_password_hash_field(client, db):
+    """未知字段必须 422：默认 extra="ignore" 会静默丢弃并返回 200。"""
+    _admin(db)
+    target = _sales(db)
+    headers = _auth(_token(client, "admin"))
+    original_hash = target.password_hash
+
+    resp = client.patch(
+        f"/api/v1/users/{target.id}",
+        headers=headers,
+        json={"display_name": "改名", "password_hash": "deadbeef"},
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "validation_error"
+    db.refresh(target)
+    assert target.password_hash == original_hash
+    assert target.display_name == "销售一"
 
 
 def test_update_user_can_clear_department(client, db):
@@ -493,6 +558,23 @@ def test_admin_cannot_strip_own_admin_role(client, db):
     assert admin.role == ROLE_ADMIN
 
 
+@pytest.mark.parametrize(
+    "payload", [{"role": "owner"}, {"status": "deleted"}], ids=["role", "status"]
+)
+def test_admin_self_patch_with_invalid_enum_returns_400(client, db, payload):
+    """非法枚举值必须先报 400，不能被自锁死守卫抢答成 403。"""
+    admin = _admin(db)
+    headers = _auth(_token(client, "admin"))
+
+    resp = client.patch(f"/api/v1/users/{admin.id}", headers=headers, json=payload)
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_value"
+    db.refresh(admin)
+    assert admin.role == ROLE_ADMIN
+    assert admin.status == "active"
+
+
 def test_admin_can_disable_another_admin(client, db):
     """自锁死拦截只针对本人，不能把"停用别的管理员"一起拦掉。"""
     _admin(db)
@@ -547,6 +629,71 @@ def test_reset_password_returns_204_and_new_password_works(client, db):
         ).status_code
         == 200
     )
+
+
+def test_admin_reset_unlocks_locked_account_immediately(client, db):
+    """锁定 → 管理员重置 → 新口令立刻登录 200：整条 HTTP 链路必须闭合。"""
+    _admin(db)
+    target = _sales(db)
+    headers = _auth(_token(client, "admin"))
+
+    client.cookies.clear()
+    for _ in range(5):
+        failed = client.post(
+            "/api/v1/auth/login", json={"username": "sales1", "password": "wrong"}
+        )
+        assert failed.status_code == 401
+    db.refresh(target)
+    assert target.locked_until is not None
+    assert (
+        client.post(
+            "/api/v1/auth/login", json={"username": "sales1", "password": PASSWORD}
+        ).status_code
+        == 423
+    )
+
+    reset = client.post(
+        f"/api/v1/users/{target.id}/reset-password",
+        headers=headers,
+        json={"new_password": NEW_PASSWORD},
+    )
+    assert reset.status_code == 204
+
+    client.cookies.clear()
+    login = client.post(
+        "/api/v1/auth/login", json={"username": "sales1", "password": NEW_PASSWORD}
+    )
+    assert login.status_code == 200, login.text
+    assert login.json()["access_token"]
+
+
+def test_reset_password_does_not_reenable_disabled_account(client, db):
+    """重置只清失败计数与锁定，不解除停用；恢复账号是独立的管理动作。"""
+    _admin(db)
+    target = _sales(db)
+    headers = _auth(_token(client, "admin"))
+    assert (
+        client.patch(
+            f"/api/v1/users/{target.id}", headers=headers, json={"status": "disabled"}
+        ).status_code
+        == 200
+    )
+
+    reset = client.post(
+        f"/api/v1/users/{target.id}/reset-password",
+        headers=headers,
+        json={"new_password": NEW_PASSWORD},
+    )
+    assert reset.status_code == 204
+
+    client.cookies.clear()
+    login = client.post(
+        "/api/v1/auth/login", json={"username": "sales1", "password": NEW_PASSWORD}
+    )
+    assert login.status_code == 403
+    assert "停用" in login.json()["message"]
+    db.refresh(target)
+    assert target.status == "disabled"
 
 
 def test_reset_password_rejects_short_password(client, db):

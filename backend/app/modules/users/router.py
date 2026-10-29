@@ -14,7 +14,7 @@ from app.core.deps import AdminUser
 from app.core.errors import ForbiddenError
 from app.core.pagination import Page, PageParams
 from app.db.session import get_db
-from app.modules.users.models import ROLE_ADMIN, STATUS_DISABLED, User
+from app.modules.users.models import ROLE_ADMIN, ROLES, STATUS_DISABLED, User
 from app.modules.users.schemas import PasswordReset, UserCreate, UserRead, UserUpdate
 from app.modules.users.service import (
     create_user,
@@ -37,8 +37,11 @@ def _guard_self_lockout(actor: User, user_id: int, changes: dict[str, Any]) -> N
         return
     if changes.get("status") == STATUS_DISABLED:
         raise ForbiddenError("不能停用自己的账号")
+    # 只拦"合法的非 admin 角色"：非法取值（如 "owner"）必须落到 service 的
+    # _validate_role 得到 400「未知角色」，否则同一路径下非法 role 是 403、
+    # 非法 status 是 400，前端按 code 提示时会被误导成权限问题。
     role = changes.get("role")
-    if role is not None and role != ROLE_ADMIN:
+    if role in ROLES and role != ROLE_ADMIN:
         raise ForbiddenError("不能降级自己的管理员角色")
 
 

@@ -53,7 +53,7 @@ def _fixture(db):
     )
     sa = create_user(
         db,
-        username="sa",
+        username="sales_a",
         password="Passw0rd!",
         display_name="销售A",
         role=ROLE_SALES,
@@ -61,7 +61,7 @@ def _fixture(db):
     )
     sb = create_user(
         db,
-        username="sb",
+        username="sales_b",
         password="Passw0rd!",
         display_name="销售B",
         role=ROLE_SALES,
