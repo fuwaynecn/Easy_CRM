@@ -137,6 +137,20 @@ def test_list_users_filters_by_keyword(client, db):
     assert by_display_name["total"] == 1
 
 
+@pytest.mark.parametrize("keyword", ["%", "_", "\\"], ids=["percent", "underscore", "backslash"])
+def test_list_users_keyword_treats_wildcards_literally(client, db, keyword):
+    """LIKE 通配符必须当普通字符：搜索 "%" 不能退化成"匹配全部"。"""
+    _bootstrap(db)
+    headers = _auth(_token(client, "admin"))
+
+    body = client.get(
+        "/api/v1/users", headers=headers, params={"keyword": keyword}
+    ).json()
+
+    assert body["total"] == 0
+    assert body["items"] == []
+
+
 def test_list_users_paginates(client, db):
     _bootstrap(db)
     headers = _auth(_token(client, "admin"))

@@ -11,6 +11,7 @@ from app.core.config import DEV_JWT_SECRET_PLACEHOLDER, settings
 from app.core.errors import AppError, error_response
 from app.modules.auth.router import me_router
 from app.modules.auth.router import router as auth_router
+from app.modules.customers.router import router as customers_router
 from app.modules.departments.router import router as departments_router
 from app.modules.users.router import router as users_router
 
@@ -109,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(me_router, prefix="/api/v1")
     app.include_router(users_router, prefix="/api/v1")
+    app.include_router(customers_router, prefix="/api/v1")
 
     return app
 

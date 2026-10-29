@@ -16,6 +16,7 @@ from app.core.errors import (
     WeakPasswordError,
 )
 from app.core.security import DECOY_PASSWORD_HASH, hash_password, verify_password
+from app.core.text import LIKE_ESCAPE, contains_pattern
 from app.modules.departments.service import get_department
 from app.modules.users.models import (
     ROLE_ADMIN,
@@ -36,6 +37,7 @@ __all__ = [
     "USER_STATUSES",
     "authenticate",
     "create_user",
+    "get_user",
     "get_user_by_username",
     "list_users",
     "reset_password",
@@ -85,6 +87,11 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def get_user(db: Session, user_id: int) -> User | None:
+    """按 id 取用户：其他模块（客户归属校验等）走这里，不直接 import User 模型。"""
+    return db.get(User, user_id)
+
+
 def get_user_by_username(db: Session, username: str) -> User | None:
     """按登录名查用户，两端统一 strip。
 
@@ -106,8 +113,14 @@ def list_users(
     """返回当前页用户与满足条件的总数（分页体需要 total，不能只看本页）。"""
     stmt = select(User)
     if keyword and keyword.strip():
-        like = f"%{keyword.strip()}%"
-        stmt = stmt.where(or_(User.username.ilike(like), User.display_name.ilike(like)))
+        # 关键字里的 % 与 _ 必须按字面量匹配，否则搜索 "%" 会返回全部用户
+        pattern = contains_pattern(keyword.strip())
+        stmt = stmt.where(
+            or_(
+                User.username.ilike(pattern, escape=LIKE_ESCAPE),
+                User.display_name.ilike(pattern, escape=LIKE_ESCAPE),
+            )
+        )
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
     rows = (
         db.execute(
