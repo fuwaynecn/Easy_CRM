@@ -21,6 +21,16 @@ const PROCUREMENT_LABEL: Record<string, string> = {
   other: "其他",
 };
 
+// 公海徽标。判定只有一条：owner_id === null（与详情页 publicPool/writable 同一口径）。
+// 只给公海客户标记——自己名下的客户不标，否则「每行都有标签」等于没有标签。
+function PublicPoolBadge() {
+  return (
+    <span className="inline-flex shrink-0 items-center rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-800">
+      公海
+    </span>
+  );
+}
+
 const EMPTY_FORM = {
   name: "",
   industry: "",
@@ -89,6 +99,8 @@ export default function CustomerListPage() {
   });
 
   const data = query.data;
+  // 本页是否有公海客户：有才显示那行说明，平时不占版面。
+  const hasPublicPool = (data?.items ?? []).some((c) => c.owner_id === null);
   // 页码一律以服务端回显为准（后端可能把越界页钳制回最后一页）。
   const currentPage = data?.page ?? page;
   const pageCount = Math.max(1, Math.ceil((data?.total ?? 0) / Math.max(1, data?.page_size ?? 20)));
@@ -178,6 +190,14 @@ export default function CustomerListPage() {
       {/* 出错时连占位数据一起藏起来：状态切换期间不能把上一个查询的客户字段留在屏幕上。 */}
       {query.isError ? null : (
         <>
+          {/* 说明只在真有公海客户时出现，且只承诺已存在的事实：P1 没有「领取」功能，
+              所以不写「领取后可编辑」。 */}
+          {hasPublicPool ? (
+            <p className="rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-800">
+              标有「公海」的客户尚未分配负责人，销售/主管只读。
+            </p>
+          ) : null}
+
           <div className="hidden overflow-hidden rounded-lg border border-slate-200 bg-white md:block">
             <table className="w-full text-sm">
               <thead className="bg-slate-50 text-left text-slate-500">
@@ -193,12 +213,16 @@ export default function CustomerListPage() {
                 {data?.items.map((c) => (
                   <tr key={c.id} className="border-t border-slate-100 hover:bg-slate-50">
                     <td className="px-3 py-2">
-                      <Link
-                        to={`/customers/${c.id}`}
-                        className="break-words text-brand-600 hover:underline"
-                      >
-                        {c.name}
-                      </Link>
+                      {/* flex-wrap：徽标与长客户名在窄列里换行显示，不撑宽表格。 */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Link
+                          to={`/customers/${c.id}`}
+                          className="min-w-0 break-words text-brand-600 hover:underline"
+                        >
+                          {c.name}
+                        </Link>
+                        {c.owner_id === null ? <PublicPoolBadge /> : null}
+                      </div>
                     </td>
                     <td className="px-3 py-2">{LEVEL_LABEL[c.level] ?? c.level}</td>
                     <td className="px-3 py-2 text-slate-600">{c.region ?? "—"}</td>
@@ -231,8 +255,14 @@ export default function CustomerListPage() {
                     {LEVEL_LABEL[c.level] ?? c.level}
                   </span>
                 </div>
-                <div className="mt-1 break-words text-xs text-slate-500">
-                  {c.region ?? "—"} · {BUDGET_LABEL[c.budget_status] ?? c.budget_status}
+                {/* 徽标放在第二行（region · budget 那一行）而不是名称行：375px 下名称
+                    已有等级占位，再挤一个徽标会把长公司名压成竖排。这一行 flex-wrap +
+                    min-w-0，徽标 shrink-0 不被压扁，文本仍可断行。 */}
+                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+                  {c.owner_id === null ? <PublicPoolBadge /> : null}
+                  <span className="min-w-0 break-words">
+                    {c.region ?? "—"} · {BUDGET_LABEL[c.budget_status] ?? c.budget_status}
+                  </span>
                 </div>
               </Link>
             ))}

@@ -30,6 +30,8 @@ export interface Customer {
   budget_status: string;
   status: string;
   owner_id: number | null;
+  // 后端 CustomerRead 回填负责人姓名；公海客户 owner_id 与 owner_name 同为 null。
+  owner_name: string | null;
   department_id: number | null;
   last_activity_at: string | null;
   remark: string | null;

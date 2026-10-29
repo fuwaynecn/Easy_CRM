@@ -316,15 +316,12 @@ export default function CustomerDetailPage() {
   const publicPool = customer.owner_id === null;
   const writable = !publicPool || user?.role === "admin";
 
-  // 负责人姓名：CustomerRead 只有 owner_id（没有 owner_name），而 GET /users 仅
-  // 管理员可读，销售拿不到人员名录。因此：自己名下 → 显示自己的姓名；无归属 →
-  // 公海；其余 → 如实显示 id，不编造姓名（见任务报告"偏离说明"）。
-  const ownerLabel =
-    customer.owner_id === null
-      ? "未分配（公海）"
-      : user !== null && user.id === customer.owner_id
-        ? user.display_name
-        : `用户 #${customer.owner_id}`;
+  // 负责人姓名：CustomerRead 现已带 owner_name（后端回填负责人 display_name），
+  // 公海客户的 owner_id / owner_name 同为 null。判定仍以 owner_id 为准，与列表页
+  // 徽标、下面的 writable 用同一个口径；owner_name 缺失时退回 id，绝不显示「用户 #null」。
+  const ownerLabel = publicPool
+    ? "未分配（公海）"
+    : (customer.owner_name ?? `用户 #${customer.owner_id}`);
 
   const contacts = contactsQuery.data ?? [];
 
