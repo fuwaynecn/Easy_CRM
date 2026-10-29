@@ -122,6 +122,24 @@ def _names(body: dict) -> set[str]:
     return {item["name"] for item in body["items"]}
 
 
+def _history(db, opportunity_id: int) -> list[StageHistory]:
+    """按 id 升序读某条机会的阶段历史。
+
+    先 ``expire_all()``：测试里的 ``db`` 与 ``client`` 共用同一个会话，不 expire 会读到
+    缓存里的旧状态，"403 之后 history 没多"这种断言就变成了永远为真。
+    """
+    db.expire_all()
+    return list(
+        db.execute(
+            select(StageHistory)
+            .where(StageHistory.opportunity_id == opportunity_id)
+            .order_by(StageHistory.id)
+        )
+        .scalars()
+        .all()
+    )
+
+
 def test_sales_creates_customer_and_primary_contact_moves(client, db):
     """销售建客户 → 加联系人 → 改联系人 → 设主联系人 → 原主的标记被清掉。"""
     _setup(db)
@@ -365,15 +383,27 @@ def test_opportunity_lifecycle_end_to_end(client, db):
     from/to 序列。history 是漏斗报表的唯一数据来源，序列错一位报表就会把"重开"算成
     两次赢单。
 
-    重开与输单都用主管账号：重开限 `manager`/`admin`（销售试一次必须 403，这一条也
-    钉在这里）。输单原因取 `scripts.seed.LOST_REASONS` 的第一条，避免测试里另造一套
-    字典口径——种子改名而测试没跟，`KeyError`/404 会立刻暴露。
+    重开与输单都用主管账号：重开限 `manager`/`admin`（销售试一次必须 403，并且 403
+    之后 `stage` 与 history 都不能变，这一条也钉在这里）。测试库不跑种子，所以输单
+    原因按 `scripts.seed.LOST_REASONS` 的**同一个元组**用服务层建出来（不硬编码中文，
+    种子改名这里跟着变），再用 `GET /lost-reasons` 核对读接口返回的就是这一套口径——
+    下拉框的数据源与测试用的字典必须同源，否则"测试里能输单、界面上选不到原因"
+    这种错会被漏掉。
     """
     people = _setup(db)
+    sales1_id = people["sales1"].id
+    boss_id = people["boss"].id
     sales = _auth(client, "sales1")
     customer = _create_customer(client, sales, "端到端制造有限公司")
-    # 种子口径的输单原因（P2 只有只读接口，测试里用服务层建一条同名记录）
-    reason = create_lost_reason(db, LostReasonCreate(name=LOST_REASONS[0]))
+
+    # 测试库不跑种子：按种子常量建出整套字典，并核对读接口（下拉框的数据源）口径一致。
+    reasons = [
+        create_lost_reason(db, LostReasonCreate(name=name)) for name in LOST_REASONS
+    ]
+    dictionary = client.get("/api/v1/lost-reasons", headers=sales)
+    assert dictionary.status_code == 200, dictionary.text
+    assert [item["name"] for item in dictionary.json()] == list(LOST_REASONS)
+    reason = reasons[0]
 
     created = client.post(
         "/api/v1/opportunities",
@@ -413,6 +443,17 @@ def test_opportunity_lifecycle_end_to_end(client, db):
         assert resp.status_code == 200, resp.text
         assert resp.json()["stage"] == stage
 
+    # 在 proposal 之后 PATCH 改一次金额：这是证明 `amount_snapshot` 是"变更当刻的值"
+    # 而不是"join 回 opportunities 的现值"的唯一办法——不改金额时六行快照全一样，
+    # 两种实现都绿。改在这里让前三行旧值、后三行新值。
+    repriced = client.patch(
+        f"/api/v1/opportunities/{opportunity_id}",
+        headers=sales,
+        json={"amount": "200000.00"},
+    )
+    assert repriced.status_code == 200, repriced.text
+    assert repriced.json()["amount"] == "200000.00"
+
     won = client.post(
         f"/api/v1/opportunities/{opportunity_id}/stage",
         headers=sales,
@@ -422,6 +463,7 @@ def test_opportunity_lifecycle_end_to_end(client, db):
     assert won.json()["won_at"] is not None
     assert won.json()["win_rate"] == 100
     assert won.json()["lost_reason_id"] is None
+    assert won.json()["amount"] == "200000.00"
 
     # 销售不能重开自己赢的单，且 403 不能让状态变化
     denied = client.post(
@@ -432,6 +474,19 @@ def test_opportunity_lifecycle_end_to_end(client, db):
     assert denied.status_code == 403, denied.text
     assert denied.json()["code"] == "forbidden"
     assert denied.json()["message"] == "仅主管及以上可重开已关闭的机会"
+
+    # 403 不能让状态变化：阶段仍是 won、history 也没有多出一行。失败请求写过半条历史
+    # 是最难查的一类 bug（卡片没动，报表却多了一次"重开"）。
+    assert [row.to_stage for row in _history(db, opportunity_id)] == [
+        "contact",
+        "needs",
+        "proposal",
+        "won",
+    ]
+    denied_after = db.get(Opportunity, opportunity_id)
+    assert denied_after is not None
+    assert denied_after.stage == "won"
+    assert denied_after.won_at is not None
 
     boss = _auth(client, "boss")
     # 重开原因必填：缺了是 400（不是悄悄写一条 note 为空的历史）
@@ -478,20 +533,12 @@ def test_opportunity_lifecycle_end_to_end(client, db):
     columns = {column["stage"]: column for column in board.json()["columns"]}
     assert columns["won"]["total"] == 0
     assert columns["lost"]["total"] == 1
-    assert columns["lost"]["amount_total"] == "123456.78"
+    assert columns["lost"]["amount_total"] == "200000.00"
     assert columns["lost"]["items"][0]["id"] == opportunity_id
+    assert columns["lost"]["items"][0]["amount"] == "200000.00"
     assert columns["contact"]["total"] == 0
 
-    db.expire_all()
-    history = list(
-        db.execute(
-            select(StageHistory)
-            .where(StageHistory.opportunity_id == opportunity_id)
-            .order_by(StageHistory.id)
-        )
-        .scalars()
-        .all()
-    )
+    history = _history(db, opportunity_id)
     assert [(row.from_stage, row.to_stage) for row in history] == [
         (None, "contact"),
         ("contact", "needs"),
@@ -502,9 +549,27 @@ def test_opportunity_lifecycle_end_to_end(client, db):
     ]
     # 重开原因落在**重开那一行**上；终态转换与创建都不带 note
     assert [row.note for row in history] == [None, None, None, None, reopen_note, None]
-    assert history[4].operator_id == people["boss"].id
-    # 金额快照记的是变更当刻的值，不是 join 回 opportunities 的现值
-    assert {str(row.amount_snapshot) for row in history} == {"123456.78"}
+    # 操作人逐行钉住：创建与三次推进是 sales1，重开与输单是 boss。只钉重开那一行会漏掉
+    # "创建/推进的 operator 写成了别人"这种错——报表按操作人统计时它会把业绩算错人。
+    assert [row.operator_id for row in history] == [
+        sales1_id,
+        sales1_id,
+        sales1_id,
+        sales1_id,
+        boss_id,
+        boss_id,
+    ]
+    # 金额快照记的是**变更当刻**的值：前三行是 PATCH 之前的 123456.78，后三行是
+    # PATCH 成 200000.00 之后的。若实现改成 join 回 opportunities 的现值，
+    # 这六行会全变成 200000.00，报表的历史成交额就被现值篡改了。
+    assert [str(row.amount_snapshot) for row in history] == [
+        "123456.78",
+        "123456.78",
+        "123456.78",
+        "200000.00",
+        "200000.00",
+        "200000.00",
+    ]
 
     opportunity = db.get(Opportunity, opportunity_id)
     assert opportunity is not None
@@ -512,3 +577,4 @@ def test_opportunity_lifecycle_end_to_end(client, db):
     assert opportunity.won_at is None
     assert opportunity.lost_reason_id == reason.id
     assert opportunity.lost_note == "客户把预算挪到明年"
+    assert str(opportunity.amount) == "200000.00"
