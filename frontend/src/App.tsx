@@ -1,29 +1,16 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
-import { AuthProvider, useAuth } from "./auth/AuthProvider";
+import { AuthProvider } from "./auth/AuthProvider";
 import { RequireAuth } from "./auth/RequireAuth";
+import { AppShell } from "./components/AppShell";
+import CustomerDetailPage from "./pages/CustomerDetailPage";
+import CustomerListPage from "./pages/CustomerListPage";
 import LoginPage from "./pages/LoginPage";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
 });
-
-function HomePage() {
-  const { user, logout } = useAuth();
-  return (
-    <div className="p-6">
-      <h1 className="text-lg font-semibold">欢迎，{user?.display_name}</h1>
-      <p className="mt-1 text-sm text-slate-500">角色：{user?.role}</p>
-      <button
-        onClick={() => void logout()}
-        className="mt-4 rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-100"
-      >
-        退出登录
-      </button>
-    </div>
-  );
-}
 
 export default function App() {
   return (
@@ -32,15 +19,28 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/" element={<Navigate to="/customers" replace />} />
             <Route
-              path="/"
+              path="/customers"
               element={
                 <RequireAuth>
-                  <HomePage />
+                  <AppShell>
+                    <CustomerListPage />
+                  </AppShell>
                 </RequireAuth>
               }
             />
-            <Route path="*" element={<Navigate to="/" replace />} />
+            <Route
+              path="/customers/:id"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <CustomerDetailPage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            <Route path="*" element={<Navigate to="/customers" replace />} />
           </Routes>
         </BrowserRouter>
       </AuthProvider>

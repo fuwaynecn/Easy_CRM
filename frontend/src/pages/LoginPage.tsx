@@ -1,17 +1,24 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Navigate, useLocation, useNavigate } from "react-router-dom";
 
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import { Field } from "../components/Field";
 
 export default function LoginPage() {
-  const { login } = useAuth();
+  const { user, login } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // RequireAuth 把人踢到登录页时会带上原地址，登录成功后回到那里；没有就进客户列表。
+  // 过滤掉非字符串与 /login 自身，避免登录页自我重定向成死循环。
+  const fromState = (location.state as { from?: unknown } | null)?.from;
+  const from =
+    typeof fromState === "string" && fromState !== "/login" ? fromState : "/customers";
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -19,13 +26,16 @@ export default function LoginPage() {
     setSubmitting(true);
     try {
       await login(username, password);
-      navigate("/", { replace: true });
+      navigate(from, { replace: true });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "登录失败，请重试");
     } finally {
       setSubmitting(false);
     }
   }
+
+  // 已登录用户再访问 /login 不停留在登录页，直接送到目标地址。
+  if (user !== null) return <Navigate to={from} replace />;
 
   return (
     <div className="flex min-h-full items-center justify-center px-4">
