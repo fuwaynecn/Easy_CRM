@@ -1,5 +1,8 @@
 from typing import Any
 
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+
 
 class AppError(Exception):
     status_code: int = 400
@@ -9,6 +12,22 @@ class AppError(Exception):
         self.message = message
         self.detail = detail
         super().__init__(message)
+
+
+def error_response(exc: AppError) -> JSONResponse:
+    """把 AppError 统一转成响应对象。
+
+    全局异常处理器与 /auth/refresh 都走这里，保证两处错误体不会漂移；后者必须自己
+    构造响应对象（不能 raise），才能在同一个对象上清 refresh cookie。
+    """
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "message": exc.message,
+            "detail": jsonable_encoder(exc.detail),
+        },
+    )
 
 
 class UnauthorizedError(AppError):

@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     login_max_failures: int = 5
     login_lock_minutes: int = 15
     cookie_secure: bool = False
+    # 运行环境（dev / test / prod ...）。仅用于启动配置告警的判定，不参与业务逻辑。
+    environment: str = "dev"
 
 
 settings = Settings()

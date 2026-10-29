@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -52,6 +53,21 @@ def test_password_hash_roundtrip():
 def test_verify_password_returns_false_for_dirty_hash(dirty_hash):
     """外部导入的脏哈希必须返回 False，不能抛异常（否则登录路径 500）。"""
     assert verify_password("x", dirty_hash) is False
+
+
+def test_verify_password_logs_exception_type_only(caplog):
+    """脏哈希要留下可诊断的日志（异常类型名），但绝不能带明文口令或哈希本身。"""
+    plain = "S3cret-Passw0rd!"
+    dirty = "not-a-hash"
+    with caplog.at_level(logging.DEBUG, logger="app.core.security"):
+        assert verify_password(plain, dirty) is False
+    messages = [r.getMessage() for r in caplog.records if r.name == "app.core.security"]
+    logged = [m for m in messages if m.startswith("口令校验失败: ")]
+    assert logged
+    assert all(m.split(": ", 1)[1].isidentifier() for m in logged)
+    for message in messages:
+        assert plain not in message
+        assert dirty not in message
 
 
 def test_user_create_and_password_reset_repr_hide_password():

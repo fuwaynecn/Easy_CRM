@@ -4,6 +4,7 @@ access token 与 refresh token 用 payload 里的 ``type`` 区分；解码时校
 refresh token 因此无法被当成 access token 使用。
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import jwt
@@ -11,6 +12,8 @@ from pwdlib import PasswordHash
 
 from app.core.config import settings
 from app.core.errors import UnauthorizedError
+
+logger = logging.getLogger(__name__)
 
 # pwdlib 的 recommended() 当前为 Argon2id（argon2-cffi 默认成本参数）
 _password_hash = PasswordHash.recommended()
@@ -26,12 +29,14 @@ def hash_password(raw: str) -> str:
 def verify_password(raw: str, hashed: str | None) -> bool:
     """校验口令；脏哈希（空串、None、非 argon2）一律返回 False。
 
-    外部导入的数据可能带来无法解析的哈希，这里必须吞掉异常。异常分支不落日志：
-    日志里既不能有明文口令，也不能有口令哈希。
+    外部导入的数据可能带来无法解析的哈希，这里必须吞掉异常。异常分支只记录异常
+    类型：日志里既不能有明文口令，也不能有口令哈希；同时保留类型名，线上才分得清
+    "脏哈希"（InvalidHashError 之类）与 pwdlib 自身的真实故障。
     """
     try:
         return _password_hash.verify(raw, hashed or "")
-    except Exception:  # noqa: BLE001 — 脏哈希的异常类型不可枚举，必须全部吞掉
+    except Exception as exc:  # noqa: BLE001 — 脏哈希的异常类型不可枚举，必须全部吞掉
+        logger.debug("口令校验失败: %s", type(exc).__name__)
         return False
 
 

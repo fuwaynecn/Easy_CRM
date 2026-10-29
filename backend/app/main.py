@@ -8,18 +8,42 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import DEV_JWT_SECRET_PLACEHOLDER, settings
-from app.core.errors import AppError
+from app.core.errors import AppError, error_response
 from app.modules.auth.router import me_router
 from app.modules.auth.router import router as auth_router
 from app.modules.departments.router import router as departments_router
 
 logger = logging.getLogger(__name__)
 
+# 开发/测试环境不需要 COOKIE_SECURE；其余环境一律要求开启。
+NON_PRODUCTION_ENVIRONMENTS = frozenset({"dev", "development", "local", "test", "testing"})
+
+# 已打印过的启动告警键。create_app() 在测试里会被反复调用（每个 client 夹具一次），
+# 不加这个标记同一句告警会重复几十遍，把真正的问题淹掉。
+_warned_startup_issues: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key in _warned_startup_issues:
+        return
+    _warned_startup_issues.add(key)
+    logger.warning(message)
+
 
 def create_app() -> FastAPI:
     if settings.jwt_secret == DEV_JWT_SECRET_PLACEHOLDER:
-        logger.warning(
-            "当前 JWT 密钥仍是开发占位值，请通过环境变量 JWT_SECRET 配置真实密钥"
+        _warn_once(
+            "jwt_secret",
+            "当前 JWT 密钥仍是开发占位值，请通过环境变量 JWT_SECRET 配置真实密钥",
+        )
+    if (
+        not settings.cookie_secure
+        and settings.environment.strip().lower() not in NON_PRODUCTION_ENVIRONMENTS
+    ):
+        _warn_once(
+            "cookie_secure",
+            f"当前环境为 {settings.environment}，但 COOKIE_SECURE 未开启："
+            "生产环境必须设置 COOKIE_SECURE=true，否则 refresh cookie 会以明文 HTTP 传输",
         )
 
     app = FastAPI(title="Easy CRM API", version="0.1.0")
@@ -33,14 +57,7 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(AppError)
     async def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "code": exc.code,
-                "message": exc.message,
-                "detail": jsonable_encoder(exc.detail),
-            },
-        )
+        return error_response(exc)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(
@@ -67,12 +84,19 @@ def create_app() -> FastAPI:
     async def _validation_exception_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        # 一律删掉 input：pydantic 会把校验失败的原始输入回显到 detail[].input，
+        # 口令字段（哪怕声明成 SecretStr）也会以明文出现。password 只是当前已知的
+        # 一种泄漏，整类删掉比逐个字段打补丁更稳；loc/msg/type/ctx 足够前端定位。
+        details = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
         return JSONResponse(
             status_code=422,
             content={
                 "code": "validation_error",
                 "message": "请求参数校验失败",
-                "detail": jsonable_encoder(exc.errors()),
+                "detail": jsonable_encoder(details),
             },
         )
 
