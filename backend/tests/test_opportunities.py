@@ -15,6 +15,9 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
+# 以模块方式导入，看板截断测试要 monkeypatch.BOARD_COLUMN_LIMIT（`from ... import board`
+# 拿到的是函数对象，改不到它读的模块全局量）
+import app.modules.opportunities.service as opportunity_service
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
 from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
@@ -869,3 +872,26 @@ def test_stage_change_on_deleted_opportunity_is_404(db):
 
     with pytest.raises(NotFoundError):
         change_stage(db, f["sa"], opportunity.id, StageChange(stage="needs"))
+
+
+# --- 看板截断守卫 --------------------------------------------------------
+
+
+def test_board_truncates_items_but_keeps_full_totals(db, monkeypatch):
+    """``total`` / ``amount_total`` 是全量聚合，只有 ``items`` 受列上限约束。
+
+    这是 `/opportunities/board` 唯一的存在理由：前端若改用"拉一页列表再分组"，
+    超过上限的机会就会被静默丢掉，看板上的"在谈金额"随之变小。截断只发生一次
+    （明细），聚合必须覆盖全部数据——把 ``BOARD_COLUMN_LIMIT`` 压到 1 才能看出
+    这两件事是否真的分开算。
+    """
+    f = _setup(db)
+    _make(db, f["sa"], f["cust_a"], name="甲单", amount=Decimal(100))
+    _make(db, f["sa"], f["cust_a"], name="乙单", amount=Decimal(250))
+    monkeypatch.setattr(opportunity_service, "BOARD_COLUMN_LIMIT", 1)
+
+    column = {column.stage: column for column in board(db, f["sa"])}["contact"]
+
+    assert column.total == 2                 # 聚合不受截断影响
+    assert len(column.items) == 1            # 明细被截到上限
+    assert column.amount_total == Decimal("350.00")

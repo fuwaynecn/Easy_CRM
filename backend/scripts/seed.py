@@ -15,6 +15,8 @@
 import argparse
 import sys
 from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -29,8 +31,12 @@ from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.models import Department
 from app.modules.departments.service import create_department
+from app.modules.lost_reasons.models import LostReason
 from app.modules.lost_reasons.schemas import LostReasonCreate
 from app.modules.lost_reasons.service import create_lost_reason, list_lost_reasons
+from app.modules.opportunities.models import Opportunity
+from app.modules.opportunities.schemas import OpportunityCreate, StageChange
+from app.modules.opportunities.service import change_stage, create_opportunity
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
 from app.modules.users.service import create_user, get_user_by_username
 
@@ -171,6 +177,80 @@ CUSTOMERS = (
 )
 
 
+@dataclass(frozen=True)
+class SeedOpportunity:
+    """一条种子机会。
+
+    种子刻意不直接建在终态上：``STAGE_PATH`` 描述"从 contact 一路走到目标阶段"的
+    路径，播种时逐阶段调用 ``change_stage``，这样 `stage_histories` 里有真实的推进
+    轨迹，看板与（将来的）漏斗报表才有东西可看。
+    """
+
+    customer: str
+    name: str
+    stage: str
+    amount: str
+    expected_close_date: date | None = None
+    competitor: str | None = None
+    win_rate: int | None = None
+    lost_reason: str | None = None
+    lost_note: str | None = None
+
+
+# stage → 从 contact 起要依次经过的阶段
+STAGE_PATH = {
+    "contact": (),
+    "needs": ("needs",),
+    "proposal": ("needs", "proposal"),
+    "negotiation": ("needs", "proposal", "negotiation"),
+    "won": ("needs", "proposal", "negotiation", "won"),
+    "lost": ("needs", "proposal", "lost"),
+}
+
+OPPORTUNITIES = (
+    SeedOpportunity(
+        customer="杭州智造装备有限公司",
+        name="喷涂产线一期改造",
+        stage="negotiation",
+        amount="1800000.00",
+        expected_close_date=date(2026, 12, 15),
+        competitor="苏州某集成商",
+        win_rate=60,       # 手工赢单率：验证"改阶段不覆盖手改值"在真实数据上成立
+    ),
+    SeedOpportunity(
+        customer="杭州智造装备有限公司",
+        name="打磨机器人单元",
+        stage="contact",
+        amount="600000.00",
+        expected_close_date=date(2027, 3, 31),
+    ),
+    SeedOpportunity(
+        customer="宁波海天涂装有限公司",
+        name="涂装线自动化改造",
+        stage="proposal",
+        amount="950000.00",
+        expected_close_date=date(2026, 11, 30),
+        competitor="本地集成商",
+    ),
+    SeedOpportunity(
+        customer="上海精工机器人系统有限公司",
+        name="框架协议首批订单",
+        stage="won",
+        amount="2400000.00",
+        expected_close_date=date(2026, 10, 15),
+    ),
+    SeedOpportunity(
+        customer="广州鼎盛汽车零部件有限公司",
+        name="焊装线改造",
+        stage="lost",
+        amount="420000.00",
+        expected_close_date=date(2026, 9, 30),
+        lost_reason="价格过高",
+        lost_note="对手整体报价低约 15%",
+    ),
+)
+
+
 def _seed_lost_reasons(db: Session) -> tuple[int, list[str], list[str]]:
     """按名称判重播种输单原因，返回（新建数、新建明细、跳过明细）。
 
@@ -294,6 +374,67 @@ def _create_contact_if_missing(
     return 1
 
 
+def _find_opportunity(db: Session, customer_id: int, name: str) -> int | None:
+    """按（客户，机会名称）判重。
+
+    软删的也跳过：删掉再建同名是合法操作，但种子脚本不该在每次执行时把用户**刚
+    删掉**的机会重新建出来——那会让"我删了它"变成"它又回来了"。
+    """
+    return db.execute(
+        select(Opportunity.id).where(
+            Opportunity.customer_id == customer_id, Opportunity.name == name
+        )
+    ).scalar_one_or_none()
+
+
+def _seed_opportunities(
+    db: Session,
+    customers: dict[str, Customer],
+    owners: dict[int, User],
+    reasons: dict[str, LostReason],
+) -> tuple[int, list[str], list[str]]:
+    """按（客户，机会名称）判重播种机会，返回（新建数、新建明细、跳过明细）。
+
+    写入一律走 service：``create_opportunity`` 负责"负责人继承客户 + 首条 history"，
+    ``change_stage`` 负责"逐阶段推进 + 每步一条 history"。种子自己拼 INSERT 会绕过
+    这两条规则，造出一批与接口建出来的机会不一样的记录——验收时最先露馅的就是它们
+    在看板上没有 history、赢单没有 `won_at`。
+    """
+    created: list[str] = []
+    skipped: list[str] = []
+    for spec in OPPORTUNITIES:
+        label = f"{spec.customer}/{spec.name}"
+        customer = customers.get(spec.customer)
+        if customer is None or customer.owner_id is None:
+            # 公海客户没有负责人，也就不可能有机会（§3.5）。种子不制造例外。
+            skipped.append(label)
+            continue
+        if _find_opportunity(db, customer.id, spec.name) is not None:
+            skipped.append(label)
+            continue
+        actor = owners[customer.owner_id]
+        opportunity = create_opportunity(
+            db,
+            actor,
+            OpportunityCreate(
+                customer_id=customer.id,
+                name=spec.name,
+                amount=Decimal(spec.amount),
+                expected_close_date=spec.expected_close_date,
+                competitor=spec.competitor,
+                win_rate=spec.win_rate,
+            ),
+        )
+        for stage in STAGE_PATH[spec.stage]:
+            payload: dict[str, object] = {"stage": stage}
+            if stage == "lost":
+                payload["lost_reason_id"] = reasons[str(spec.lost_reason)].id
+                payload["lost_note"] = spec.lost_note
+            change_stage(db, actor, opportunity.id, StageChange(**payload))
+        created.append(label)
+    return len(created), created, skipped
+
+
 def _seed(
     db: Session,
 ) -> tuple[dict[str, int], dict[str, list[str]], dict[str, list[str]]]:
@@ -304,6 +445,7 @@ def _seed(
         "customers": 0,
         "contacts": 0,
         "lost_reasons": 0,
+        "opportunities": 0,
     }
     created: dict[str, list[str]] = {key: [] for key in counts}
     skipped: dict[str, list[str]] = {key: [] for key in counts}
@@ -330,8 +472,10 @@ def _seed(
         _record("users", user_spec.username, was_created)
 
     admin = users["admin"]
+    customers: dict[str, Customer] = {}
     for customer_spec in CUSTOMERS:
         customer, was_created = _get_or_create_customer(db, customer_spec, users, admin)
+        customers[customer_spec.name] = customer
         _record("customers", customer_spec.name, was_created)
         for contact_spec in customer_spec.contacts:
             contact_created = _create_contact_if_missing(
@@ -340,6 +484,18 @@ def _seed(
             _record(
                 "contacts", f"{customer_spec.name}/{contact_spec.name}", contact_created
             )
+
+    # 字典必须是这次执行后的状态：输单种子按名字找原因
+    reasons = {
+        reason.name: reason for reason in list_lost_reasons(db, include_inactive=True)
+    }
+    owners = {user.id: user for user in users.values()}
+    opportunity_count, opportunity_created, opportunity_skipped = _seed_opportunities(
+        db, customers, owners, reasons
+    )
+    counts["opportunities"] = opportunity_count
+    created["opportunities"] = opportunity_created
+    skipped["opportunities"] = opportunity_skipped
 
     return counts, created, skipped
 
@@ -356,6 +512,7 @@ _LABELS = {
     "customers": "客户",
     "contacts": "联系人",
     "lost_reasons": "输单原因",
+    "opportunities": "销售机会",
 }
 
 _ROLE_LABELS = {ROLE_ADMIN: "管理员", ROLE_MANAGER: "主管", ROLE_SALES: "销售"}
@@ -388,6 +545,15 @@ def _print_summary(
     pool = [spec.name for spec in CUSTOMERS if spec.owner is None]
     if pool:
         print(f"公海客户（owner 为空，管理员列表可见）：{_join(pool)}")
+    stages: dict[str, int] = {}
+    for spec in OPPORTUNITIES:
+        stages[spec.stage] = stages.get(spec.stage, 0) + 1
+    if stages:
+        print()
+        print(
+            "销售机会（按阶段）："
+            + "、".join(f"{stage} {count} 条" for stage, count in stages.items())
+        )
 
 
 # 只有开发/测试环境允许播种：种子口令是固定且公开的（见文件头），误在生产执行

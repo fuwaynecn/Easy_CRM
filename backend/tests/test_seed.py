@@ -21,8 +21,9 @@ from app.modules.contacts.models import Contact
 from app.modules.customers.models import Customer
 from app.modules.departments.models import Department
 from app.modules.lost_reasons.models import LostReason
+from app.modules.opportunities.models import Opportunity, StageHistory
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
-from scripts.seed import LOST_REASONS, SEED_PASSWORD, main, seed
+from scripts.seed import LOST_REASONS, OPPORTUNITIES, SEED_PASSWORD, main, seed
 
 
 def _count(db, model) -> int:
@@ -30,13 +31,24 @@ def _count(db, model) -> int:
 
 
 def _counts(db) -> dict[str, int]:
+    """``seed()`` 返回值的镜像，必须与返回值同键——两边一旦漂移，"空库上返回值等于
+    实际行数"这条断言就会悄悄失效。
+
+    阶段历史**不在这里**：它是机会的副作用（创建 1 条 + 每次推进 1 条），不是独立
+    播种项，``seed()`` 也不返回它；用 :func:`_stage_history_count` 单独断言。
+    """
     return {
         "departments": _count(db, Department),
         "users": _count(db, User),
         "customers": _count(db, Customer),
         "contacts": _count(db, Contact),
         "lost_reasons": _count(db, LostReason),
+        "opportunities": _count(db, Opportunity),
     }
+
+
+def _stage_history_count(db) -> int:
+    return _count(db, StageHistory)
 
 
 def test_entry_point_refuses_non_dev_environment(db, monkeypatch, capsys):
@@ -52,6 +64,7 @@ def test_entry_point_refuses_non_dev_environment(db, monkeypatch, capsys):
         "customers": 0,
         "contacts": 0,
         "lost_reasons": 0,
+        "opportunities": 0,
     }
     output = capsys.readouterr()
     assert "production" in output.err
@@ -68,12 +81,16 @@ def test_seed_creates_baseline_data(db):
     assert result["customers"] >= 3
     assert result["contacts"] >= 2
     assert result["lost_reasons"] == len(LOST_REASONS)
+    assert result["opportunities"] == len(OPPORTUNITIES)
+    # 每单至少一条创建历史，推进到目标阶段还要更多；"只建机会不写历史"会在这里露馅
+    assert _stage_history_count(db) >= result["opportunities"]
 
 
 def test_seed_is_idempotent(db):
     """第二次执行全部跳过：不报错、不重复插数据、总行数不变。"""
     seed(db)
     before = _counts(db)
+    histories_before = _stage_history_count(db)
 
     result = seed(db)
 
@@ -83,8 +100,11 @@ def test_seed_is_idempotent(db):
         "customers": 0,
         "contacts": 0,
         "lost_reasons": 0,
+        "opportunities": 0,
     }
     assert _counts(db) == before
+    # 机会全部跳过时不能再写阶段历史，否则每跑一次种子就伪造一段推进轨迹
+    assert _stage_history_count(db) == histories_before
 
 
 def test_seed_creates_exactly_one_admin(db):
@@ -176,3 +196,39 @@ def test_seed_creates_contacts_for_demo_customer(db):
     assert len(contacts) >= 2
     # 一个客户只能有一个主联系人（部分唯一索引盯着这条）
     assert sum(1 for contact in contacts if contact.is_primary) == 1
+
+
+def test_seeded_opportunities_have_consistent_terminal_fields(db):
+    """赢单必须有 won_at、输单必须有原因、每单都至少有一条阶段历史。
+
+    种子数据是人工验收的第一屏，它自相矛盾（比如输了却没原因）比"没有种子"更糟。
+    """
+    seed(db)
+
+    won = db.execute(select(Opportunity).where(Opportunity.stage == "won")).scalars().all()
+    lost = db.execute(select(Opportunity).where(Opportunity.stage == "lost")).scalars().all()
+    assert won and all(row.won_at is not None for row in won)
+    assert lost and all(row.lost_reason_id is not None for row in lost)
+
+    for opportunity in db.execute(select(Opportunity)).scalars().all():
+        history_count = db.execute(
+            select(func.count())
+            .select_from(StageHistory)
+            .where(StageHistory.opportunity_id == opportunity.id)
+        ).scalar_one()
+        assert history_count >= 1
+
+
+def test_seeded_opportunity_owner_matches_customer(db):
+    """机会负责人必须等于客户负责人（design §3.5）：种子不能造出"机会挂别人名下"。"""
+    seed(db)
+    rows = db.execute(
+        select(Opportunity, Customer).join(
+            Customer, Opportunity.customer_id == Customer.id
+        )
+    ).all()
+
+    assert rows
+    for opportunity, customer in rows:
+        assert customer.owner_id is not None   # 公海客户不该有机会
+        assert opportunity.owner_id == customer.owner_id

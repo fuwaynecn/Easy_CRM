@@ -15,6 +15,7 @@ from app.modules.contacts.router import router as contacts_router
 from app.modules.customers.router import router as customers_router
 from app.modules.departments.router import router as departments_router
 from app.modules.lost_reasons.router import router as lost_reasons_router
+from app.modules.opportunities.router import router as opportunities_router
 from app.modules.users.router import router as users_router
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(customers_router, prefix="/api/v1")
     app.include_router(contacts_router, prefix="/api/v1")
     app.include_router(lost_reasons_router, prefix="/api/v1")
+    app.include_router(opportunities_router, prefix="/api/v1")
 
     return app
 
