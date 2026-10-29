@@ -8,6 +8,7 @@ import { AppShell } from "./components/AppShell";
 import CustomerDetailPage from "./pages/CustomerDetailPage";
 import CustomerListPage from "./pages/CustomerListPage";
 import LoginPage from "./pages/LoginPage";
+import OpportunityBoardPage from "./pages/OpportunityBoardPage";
 import OpportunityListPage from "./pages/OpportunityListPage";
 
 const queryClient = new QueryClient({
@@ -51,13 +52,24 @@ export default function App() {
                 </RequireAuth>
               }
             />
-            {/* 看板路由（/opportunities/board）属 Task 9，本任务只交付列表页 */}
+            {/* 静态路径 /opportunities/board 与 /opportunities 互不遮蔽（Router 6 按
+                具体度匹配），但两条放一起便于阅读；`*` 必须留在最后。 */}
             <Route
               path="/opportunities"
               element={
                 <RequireAuth>
                   <AppShell>
                     <OpportunityListPage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/opportunities/board"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <OpportunityBoardPage />
                   </AppShell>
                 </RequireAuth>
               }

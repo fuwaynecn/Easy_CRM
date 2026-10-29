@@ -4,9 +4,14 @@ import { Navigate, NavLink } from "react-router-dom";
 
 import { useAuth } from "../auth/AuthProvider";
 
-const NAV = [
+/**
+ * `end` 只给「机会」：`/opportunities` 是 `/opportunities/board` 的前缀，
+ * 不加 `end` 的话看板页会让两个导航项同时高亮，用户分不清自己在哪一页。
+ */
+const NAV: { to: string; label: string; end?: boolean }[] = [
   { to: "/customers", label: "客户" },
-  { to: "/opportunities", label: "机会" },
+  { to: "/opportunities", label: "机会", end: true },
+  { to: "/opportunities/board", label: "看板" },
 ];
 
 export function AppShell({ children }: { children: ReactNode }) {
@@ -53,6 +58,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             <NavLink
               key={item.to}
               to={item.to}
+              end={item.end}
               onClick={() => setOpen(false)}
               className={({ isActive }) =>
                 `block rounded-md px-3 py-2 text-sm ${
