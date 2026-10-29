@@ -1,7 +1,6 @@
-from fastapi.testclient import TestClient
-
 from app.core.errors import ConflictError
 from app.main import create_app
+from fastapi.testclient import TestClient
 
 
 def test_health_returns_ok():

@@ -26,3 +26,5 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 沙箱下 pytest 写 .pytest_cache 会产生无法删除的空目录，直接禁用缓存插件
+addopts = "-p no:cacheprovider"
