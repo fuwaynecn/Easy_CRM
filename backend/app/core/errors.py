@@ -29,3 +29,10 @@ class NotFoundError(AppError):
 class ConflictError(AppError):
     status_code = 409
     code = "conflict"
+
+
+class LockedError(AppError):
+    """账号锁定：423 Locked，调用方据此提示剩余等待时间。"""
+
+    status_code = 423
+    code = "locked"

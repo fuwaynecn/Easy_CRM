@@ -1,7 +1,34 @@
+from datetime import UTC, datetime
+from typing import Annotated
+
+from fastapi import Depends
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, model_validator
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
+from app.core.errors import AppError
+from app.db.session import get_db
 from app.main import create_app
+
+
+def _app_with_db(db):
+    """局部 app 必须 override get_db，否则测试路由一旦触库会打到开发库。"""
+    app = create_app()
+    app.dependency_overrides[get_db] = lambda: db
+    return app
+
+
+def test_local_app_routes_share_the_fixture_session(db):
+    app = _app_with_db(db)
+
+    @app.get("/__db")
+    def _db_route(session: Annotated[Session, Depends(get_db)]) -> dict:
+        return {"same_session": session is db, "one": session.scalar(text("SELECT 1"))}
+
+    with TestClient(app) as client:
+        resp = client.get("/__db")
+    assert resp.json() == {"same_session": True, "one": 1}
 
 
 def test_unknown_path_returns_unified_404(client):
@@ -20,10 +47,11 @@ def test_method_not_allowed_returns_unified_405(client):
     assert body["code"] == "method_not_allowed"
     assert body["message"] == "请求方法不被允许"
     assert isinstance(body["detail"], str)
+    assert resp.headers["allow"] == "GET"
 
 
 def test_validation_error_returns_unified_422(db):
-    app = create_app()
+    app = _app_with_db(db)
 
     @app.get("/__paged")
     def _paged(page: int):
@@ -40,7 +68,7 @@ def test_validation_error_returns_unified_422(db):
 
 
 def test_validation_error_with_exception_in_ctx_is_serializable(db):
-    app = create_app()
+    app = _app_with_db(db)
 
     class Payload(BaseModel):
         x: int
@@ -59,3 +87,22 @@ def test_validation_error_with_exception_in_ctx_is_serializable(db):
     body = resp.json()
     assert body["code"] == "validation_error"
     assert body["detail"][0]["ctx"]["error"] == {}
+
+
+def test_app_error_detail_with_datetime_and_exception_is_serializable(db):
+    app = _app_with_db(db)
+
+    @app.get("/__app_error")
+    def _boom():
+        raise AppError(
+            "内部错误", detail={"at": datetime.now(UTC), "err": RuntimeError("坏掉了")}
+        )
+
+    with TestClient(app) as client:
+        resp = client.get("/__app_error")
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "bad_request"
+    assert body["message"] == "内部错误"
+    assert isinstance(body["detail"]["at"], str)
+    assert isinstance(body["detail"]["err"], dict)

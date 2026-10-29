@@ -7,6 +7,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import settings
 from app.core.errors import AppError
+from app.modules.auth.router import me_router
+from app.modules.auth.router import router as auth_router
 from app.modules.departments.router import router as departments_router
 
 
@@ -24,7 +26,11 @@ def create_app() -> FastAPI:
     async def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
-            content={"code": exc.code, "message": exc.message, "detail": exc.detail},
+            content={
+                "code": exc.code,
+                "message": exc.message,
+                "detail": jsonable_encoder(exc.detail),
+            },
         )
 
     @app.exception_handler(StarletteHTTPException)
@@ -66,6 +72,8 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(departments_router, prefix="/api/v1")
+    app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(me_router, prefix="/api/v1")
 
     return app
 

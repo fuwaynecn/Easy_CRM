@@ -6,7 +6,7 @@ from app.modules.departments.models import Department
 
 
 def list_departments(db: Session) -> list[Department]:
-    stmt = select(Department).order_by(Department.id)
+    stmt = select(Department).order_by(Department.name)
     return list(db.execute(stmt).scalars().all())
 
 
