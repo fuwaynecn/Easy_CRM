@@ -1,5 +1,6 @@
-from app.db.base import Base
 from sqlalchemy import text
+
+from app.db.base import Base
 
 
 def test_database_is_postgres(db):

@@ -28,3 +28,7 @@ include = ["app*"]
 testpaths = ["tests"]
 # 沙箱下 pytest 写 .pytest_cache 会产生无法删除的空目录，直接禁用缓存插件
 addopts = "-p no:cacheprovider"
+
+[tool.ruff.lint]
+# 默认规则集不含 W（如 W292 行尾换行），显式开启并保持仓库整洁
+extend-select = ["W"]

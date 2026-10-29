@@ -1,4 +1,5 @@
 import pytest
+
 from app.core.errors import ConflictError
 from app.modules.departments.service import create_department, get_department
 

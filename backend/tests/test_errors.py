@@ -1,6 +1,7 @@
-from app.main import create_app
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, model_validator
+
+from app.main import create_app
 
 
 def test_unknown_path_returns_unified_404(client):
