@@ -30,6 +30,31 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 框架自产错误（404/405/422 等）没有 `message` 字段，或后端给了非字符串/空串，
+ * 都不能让界面渲染出 `[object Object]` 或一个空气泡——按状态码给一句中文兜底。
+ */
+function fallbackMessage(status: number): string {
+  switch (status) {
+    case 403:
+      return "无权执行该操作";
+    case 404:
+      return "记录不存在或已被删除";
+    case 422:
+      return "提交内容不合规，请检查后重试";
+    case 423:
+      return "账号已锁定，请稍后重试";
+    default:
+      return "请求失败";
+  }
+}
+
+/** 取一段可直接展示的中文文案：优先后端 `message`，没有可用文案时用调用方兜底。 */
+export function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError && err.message.trim() !== "") return err.message;
+  return fallback;
+}
+
 let refreshing: Promise<boolean> | null = null;
 
 export function tryRefresh(): Promise<boolean> {
@@ -76,6 +101,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       },
     });
 
+  // 只有 401 才算会话失效。403（越权）与 423（账号锁定）是必须让用户看见的
+  // 业务错误：它们在这里既不刷新、也不登出，由调用方按 `status` 渲染中文提示。
   let resp = await send();
   let retriedAfterUnauthorized = false;
   if (resp.status === 401 && accessToken) {
@@ -94,13 +121,16 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const body = await resp.json().catch(() => null);
   if (!resp.ok) {
-    const err = body as { code?: string; message?: string; detail?: unknown } | null;
-    throw new ApiError(
-      resp.status,
-      err?.code ?? "error",
-      err?.message ?? "请求失败",
-      err?.detail,
-    );
+    // 逐字段做运行时校验：`as` 断言管不了脏响应，message 不是非空字符串时
+    // 直接用它构造 Error 会渲染成 "[object Object]" 或空文本。
+    const err = body as { code?: unknown; message?: unknown; detail?: unknown } | null;
+    const rawMessage = err?.message;
+    const code = typeof err?.code === "string" && err.code !== "" ? err.code : "error";
+    const message =
+      typeof rawMessage === "string" && rawMessage.trim() !== ""
+        ? rawMessage
+        : fallbackMessage(resp.status);
+    throw new ApiError(resp.status, code, message, err?.detail);
   }
   return body as T;
 }

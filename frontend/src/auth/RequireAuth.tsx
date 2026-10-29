@@ -12,7 +12,8 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   }
   // 严格判定：只有拿到真实 user 才放行，undefined 不能被当成已登录。
   if (!user) {
-    return <Navigate to="/login" replace state={{ from: location.pathname }} />;
+    // 带上 search：`/customers?page=2` 这类深链登录后要回到原来的查询条件。
+    return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />;
   }
   return <>{children}</>;
 }

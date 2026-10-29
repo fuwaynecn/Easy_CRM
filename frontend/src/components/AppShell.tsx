@@ -10,28 +10,33 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { user, logout } = useAuth();
   const [open, setOpen] = useState(false);
 
-  // 会话中途失效的统一兜底：client.ts 在 401 且刷新失败后只清了内存 token，
-  // 这里在 user 变成 null 时把人送回登录页，避免用户卡在受保护页反复报错。
+  // 第二道保险：会话彻底失效时 client.ts 会回调 AuthProvider 把 user 清空，
+  // RequireAuth 已在外层把人送回登录页；这里拦住"将来某个受保护页不套
+  // RequireAuth"的情况，避免页面在无身份状态下继续渲染。
   if (user === null) return <Navigate to="/login" replace />;
 
   return (
     <div className="flex min-h-full flex-col">
-      <header className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
-        <div className="flex items-center gap-3">
+      <header className="flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">
+        <div className="flex min-w-0 items-center gap-3">
           <button
-            className="rounded p-1 text-slate-600 md:hidden"
+            type="button"
+            className="shrink-0 rounded p-1 text-slate-600 md:hidden"
             onClick={() => setOpen((v) => !v)}
             aria-label="菜单"
           >
             ☰
           </button>
-          <span className="font-semibold text-slate-900">Easy CRM</span>
+          <span className="min-w-0 truncate font-semibold text-slate-900">Easy CRM</span>
         </div>
-        <div className="flex items-center gap-3 text-sm text-slate-600">
-          <span>{user?.display_name}</span>
+        <div className="flex min-w-0 items-center gap-3 text-sm text-slate-600">
+          {/* 姓名可能是不可断行的长串：min-w-0 + truncate 保证它只在自己那一格里
+              收缩并省略，不会把整个 header 顶宽（375px 无横向滚动条）。 */}
+          <span className="min-w-0 truncate">{user?.display_name}</span>
           <button
+            type="button"
             onClick={() => void logout()}
-            className="rounded-md border border-slate-300 px-2.5 py-1 hover:bg-slate-100"
+            className="shrink-0 rounded-md border border-slate-300 px-2.5 py-1 hover:bg-slate-100"
           >
             退出
           </button>

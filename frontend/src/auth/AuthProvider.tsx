@@ -25,6 +25,22 @@ function isLoginResult(value: unknown): value is LoginResult {
   return typeof (user as { id?: unknown }).id === "number";
 }
 
+/**
+ * StrictMode 下 effect 会执行两次，`/me` 不像 `tryRefresh` 那样有单飞去重，会白打
+ * 一次请求。这里合并同一时刻的在途调用；请求结束即释放，不缓存结果——否则退出后
+ * 换账号登录会读到上一个人的 user。
+ */
+let meInFlight: Promise<User> | null = null;
+
+function meRequestOnce(): Promise<User> {
+  if (meInFlight === null) {
+    meInFlight = meRequest().finally(() => {
+      meInFlight = null;
+    });
+  }
+  return meInFlight;
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -46,7 +62,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const refreshed = await tryRefresh();
       if (refreshed) {
         try {
-          const me = await meRequest();
+          const me = await meRequestOnce();
           if (!cancelled) setUser(me);
         } catch {
           // 读取当前用户失败即视为未登录：token 一并清掉，失败即清干净。
