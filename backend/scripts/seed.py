@@ -12,11 +12,14 @@
 环境。入口：``cd backend && python -m scripts.seed``。
 """
 
+import argparse
+import sys
 from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.modules.contacts.models import Contact
 from app.modules.contacts.schemas import ContactCreate
@@ -342,14 +345,48 @@ def _print_summary(
         print(f"公海客户（owner 为空，管理员列表可见）：{_join(pool)}")
 
 
-def main() -> None:
+# 只有开发/测试环境允许播种：种子口令是固定且公开的（见文件头），误在生产执行
+# 等于给系统装上 5 个口令已知的账号，其中 admin 还是管理员。
+_ALLOWED_ENVIRONMENTS = frozenset({"dev", "test"})
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="初始化开发环境的种子数据")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="在非 dev/test 环境强制执行（危险：会创建口令已知的账号）",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """命令行入口：环境守卫放在这里，``seed(db)`` 本身保持可测、不读全局配置。"""
+    args = _parse_args(argv)
+    if settings.environment not in _ALLOWED_ENVIRONMENTS:
+        if not args.force:
+            print(
+                "拒绝执行种子脚本：当前 environment="
+                f"{settings.environment!r}，只允许在 dev/test 环境运行。"
+                "种子账号口令固定且公开，误在生产执行会造出 5 个口令已知的账号"
+                "（其中 admin 是管理员）。如确需执行，请显式传 --force。",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"警告：正在 {settings.environment!r} 环境使用 --force 执行种子脚本，"
+            "将创建口令已知的账号，请确认这是你想要的。",
+            file=sys.stderr,
+        )
+
     db = SessionLocal()
     try:
         counts, created, skipped = _seed(db)
     finally:
         db.close()
     _print_summary(counts, created, skipped)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

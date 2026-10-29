@@ -83,6 +83,16 @@ def _ensure_department_exists(db: Session, department_id: int | None) -> None:
         _ = get_department(db, department_id)
 
 
+# 销售与主管必须有部门：无部门时建客户会 400（负责人未分配部门），或建出双方都
+# 看不见的孤儿客户；主管的数据范围也完全依赖部门。管理员允许无部门。
+_ROLES_REQUIRING_DEPARTMENT = (ROLE_MANAGER, ROLE_SALES)
+
+
+def _require_department_for_role(role: str, department_id: int | None) -> None:
+    if role in _ROLES_REQUIRING_DEPARTMENT and department_id is None:
+        raise InvalidValueError("销售与主管必须分配部门")
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -156,6 +166,7 @@ def create_user(
     _validate_password(password)
     _validate_role(role)
     _ensure_department_exists(db, department_id)
+    _require_department_for_role(role, department_id)
     if get_user_by_username(db, cleaned_username) is not None:
         raise ConflictError("登录名已存在")
     user = User(
@@ -239,15 +250,23 @@ def update_user(db: Session, user_id: int, changes: dict[str, Any]) -> User:
         cleaned_display_name = display_name.strip()
         if not cleaned_display_name:
             raise InvalidValueError("显示名不能为空")
-        user.display_name = cleaned_display_name
 
     role = changes.get("role")
     if role is not None:
         _validate_role(role)
-        user.role = role
-
     if "department_id" in changes:
         _ensure_department_exists(db, changes["department_id"])
+    # 先按"提交后的最终状态"校验，再落赋值：校验失败时不能让 ORM 对象带着改动留在
+    # 共用 Session 里（测试与后续同请求代码都会读到脏值）。
+    final_role = role if role is not None else user.role
+    final_department_id = changes.get("department_id", user.department_id)
+    _require_department_for_role(final_role, final_department_id)
+
+    if display_name is not None:
+        user.display_name = cleaned_display_name
+    if role is not None:
+        user.role = role
+    if "department_id" in changes:
         user.department_id = changes["department_id"]
 
     status = changes.get("status")

@@ -98,6 +98,11 @@ def _new_user_payload(**overrides) -> dict:
     return payload
 
 
+def _dept_id(db) -> int:
+    """给需要部门的用例准备一个真实部门（销售与主管建号必须带部门）。"""
+    return create_department(db, "交付部").id
+
+
 def _user_id(db, username: str) -> int:
     user = get_user_by_username(db, username)
     assert user is not None, f"查询不到用户 {username}"
@@ -235,7 +240,9 @@ def test_created_user_can_login_with_real_password(client, db):
     _bootstrap(db)
     headers = _auth(_token(client, "admin"))
     resp = client.post(
-        "/api/v1/users", headers=headers, json=_new_user_payload(username="sales2")
+        "/api/v1/users",
+        headers=headers,
+        json=_new_user_payload(username="sales2", department_id=_dept_id(db)),
     )
     assert resp.status_code == 201
 
@@ -261,7 +268,9 @@ def test_username_is_stripped_on_create_and_login(client, db):
     _admin(db)
     headers = _auth(_token(client, "admin"))
     resp = client.post(
-        "/api/v1/users", headers=headers, json=_new_user_payload(username="  spacy  ")
+        "/api/v1/users",
+        headers=headers,
+        json=_new_user_payload(username="  spacy  ", department_id=_dept_id(db)),
     )
     assert resp.status_code == 201
     assert resp.json()["username"] == "spacy"
@@ -288,7 +297,7 @@ def test_create_validates_after_strip(client, db, field, value):
     resp = client.post(
         "/api/v1/users",
         headers=headers,
-        json=_new_user_payload(**{field: value}),
+        json=_new_user_payload(department_id=_dept_id(db), **{field: value}),
     )
 
     assert resp.status_code == 400
@@ -307,7 +316,9 @@ def test_weak_password_returns_400_without_echo(client, db):
     resp = client.post(
         "/api/v1/users",
         headers=headers,
-        json=_new_user_payload(username="shorty", password=plain),
+        json=_new_user_payload(
+            username="shorty", password=plain, department_id=_dept_id(db)
+        ),
     )
 
     assert resp.status_code == 400
@@ -323,7 +334,9 @@ def test_duplicate_username_returns_409(client, db):
     headers = _auth(_token(client, "admin"))
 
     resp = client.post(
-        "/api/v1/users", headers=headers, json=_new_user_payload(username="sales1")
+        "/api/v1/users",
+        headers=headers,
+        json=_new_user_payload(username="sales1", department_id=_dept_id(db)),
     )
 
     assert resp.status_code == 409
@@ -365,7 +378,11 @@ def test_unknown_department_returns_404(client, db):
 def test_user_payloads_never_leak_internal_fields(client, db):
     _bootstrap(db)
     headers = _auth(_token(client, "admin"))
-    created = client.post("/api/v1/users", headers=headers, json=_new_user_payload())
+    created = client.post(
+        "/api/v1/users",
+        headers=headers,
+        json=_new_user_payload(department_id=_dept_id(db)),
+    )
     listed = client.get("/api/v1/users", headers=headers)
     patched = client.patch(
         f"/api/v1/users/{_user_id(db, 'sales2')}",
@@ -456,9 +473,18 @@ def test_patch_rejects_password_hash_field(client, db):
     assert target.display_name == "销售一"
 
 
-def test_update_user_can_clear_department(client, db):
+def test_update_user_can_clear_department_for_admin(client, db):
+    """部门可清空只对管理员成立：销售/主管清空部门会让其建号/建客户失去归属。"""
     _admin(db)
-    target = _sales(db)
+    dept = create_department(db, "管理部")
+    target = create_user(
+        db,
+        username="admin2",
+        password=PASSWORD,
+        display_name="管理员二",
+        role=ROLE_ADMIN,
+        department_id=dept.id,
+    )
     headers = _auth(_token(client, "admin"))
 
     resp = client.patch(
@@ -467,6 +493,46 @@ def test_update_user_can_clear_department(client, db):
 
     assert resp.status_code == 200
     assert resp.json()["department_id"] is None
+
+
+@pytest.mark.parametrize(
+    "role", [ROLE_MANAGER, ROLE_SALES], ids=["manager", "sales"]
+)
+def test_create_manager_or_sales_requires_department(client, db, role):
+    _admin(db)
+    headers = _auth(_token(client, "admin"))
+
+    resp = client.post(
+        "/api/v1/users",
+        headers=headers,
+        json=_new_user_payload(username="nodept", role=role, department_id=None),
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_value"
+    assert resp.json()["message"] == "销售与主管必须分配部门"
+    assert get_user_by_username(db, "nodept") is None
+
+
+@pytest.mark.parametrize(
+    "role", [ROLE_MANAGER, ROLE_SALES], ids=["manager", "sales"]
+)
+def test_update_cannot_leave_manager_or_sales_without_department(client, db, role):
+    _admin(db)
+    target = _sales(db)
+    headers = _auth(_token(client, "admin"))
+
+    resp = client.patch(
+        f"/api/v1/users/{target.id}",
+        headers=headers,
+        json={"role": role, "department_id": None},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_value"
+    assert resp.json()["message"] == "销售与主管必须分配部门"
+    db.refresh(target)
+    assert target.department_id is not None
 
 
 def test_disabled_user_cannot_login_after_update(client, db):

@@ -15,12 +15,13 @@
 
 from sqlalchemy import func, select
 
+from app.core.config import settings
 from app.core.security import verify_password
 from app.modules.contacts.models import Contact
 from app.modules.customers.models import Customer
 from app.modules.departments.models import Department
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES, User
-from scripts.seed import SEED_PASSWORD, seed
+from scripts.seed import SEED_PASSWORD, main, seed
 
 
 def _count(db, model) -> int:
@@ -34,6 +35,24 @@ def _counts(db) -> dict[str, int]:
         "customers": _count(db, Customer),
         "contacts": _count(db, Contact),
     }
+
+
+def test_entry_point_refuses_non_dev_environment(db, monkeypatch, capsys):
+    """生产环境误执行会造出 5 个口令已知的账号（含管理员），入口必须拒绝并返回非零。"""
+    monkeypatch.setattr(settings, "environment", "production")
+
+    exit_code = main([])
+
+    assert exit_code != 0
+    assert _counts(db) == {
+        "departments": 0,
+        "users": 0,
+        "customers": 0,
+        "contacts": 0,
+    }
+    output = capsys.readouterr()
+    assert "production" in output.err
+    assert "--force" in output.err
 
 
 def test_seed_creates_baseline_data(db):

@@ -36,6 +36,7 @@ from app.modules.users.models import User
 from app.modules.users.service import (
     ROLE_ADMIN,
     ROLE_MANAGER,
+    ROLES,
     STATUS_ACTIVE,
     get_user,
 )
@@ -149,7 +150,12 @@ def _resolve_owner(
 
     销售自建归自己；主管可指定本部门成员（可写范围是本部门全部）；管理员可指定
     任何人。返回 None 表示进公海——只有管理员不指定负责人时才会这样。
+
+    未知角色在这里就拒绝，不能退化成"等价 sales"：那会让手工改坏的角色建出客户，
+    随后按作用域又看不见它（未知角色只见公海），留下谁都找不到的孤儿数据。
     """
+    if actor.role not in ROLES:
+        raise ForbiddenError("账号角色异常，请联系管理员")
     if requested_owner_id is None:
         return None if actor.role == ROLE_ADMIN else actor
     if requested_owner_id == actor.id:

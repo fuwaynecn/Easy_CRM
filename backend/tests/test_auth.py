@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import jwt
 from pydantic import SecretStr
+from sqlalchemy import text
 
 from app.core import security
 from app.core.config import settings
@@ -316,6 +317,29 @@ def test_expired_token_is_rejected(client, db, monkeypatch):
     assert claims["type"] == "access"
     resp = client.get("/api/v1/me", headers=_bearer(expired))
     assert resp.status_code == 401
+
+
+def test_unknown_role_is_rejected_by_auth_dependency(client, db):
+    """数据库里的角色被手工改成未知值时，已签发的 token 也必须立刻失效（403）。
+
+    作用域层虽然 fail-closed，但让未知角色通过鉴权会把"账号异常"伪装成"没有数据"，
+    排查时看不出根因。鉴权入口直接拒绝。
+    """
+    user = _make_user(db)
+    token = _login(client).json()["access_token"]
+    db.execute(
+        text("UPDATE users SET role = 'guest' WHERE id = :user_id"),
+        {"user_id": user.id},
+    )
+    db.commit()
+    # 测试与接口共用一个 Session：裸 SQL 改了库，身份映射里还是旧 role，必须过期
+    db.expire_all()
+
+    resp = client.get("/api/v1/me", headers=_bearer(token))
+
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "forbidden"
+    assert resp.json()["message"] == "账号角色异常，请联系管理员"
 
 
 def test_departments_list_allows_manager(client, db):

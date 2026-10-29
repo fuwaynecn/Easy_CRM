@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.errors import (
     ConflictError,
@@ -215,21 +215,48 @@ def test_sales_cannot_create_for_someone_else(db):
     assert db.execute(select(Customer)).scalars().all() == []
 
 
+def test_unknown_role_cannot_create_customer(db):
+    """未知角色不能退化成"等价 sales"：否则能建客户，建完按作用域又看不见。"""
+    f = _setup(db)
+    db.execute(
+        text("UPDATE users SET role = 'guest' WHERE id = :user_id"),
+        {"user_id": f["sa"].id},
+    )
+    db.commit()
+    db.refresh(f["sa"])
+
+    with pytest.raises(ForbiddenError) as exc:
+        create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+
+    assert exc.value.status_code == 403
+    assert exc.value.message == "账号角色异常，请联系管理员"
+    db.expire_all()
+    assert db.execute(select(Customer)).scalars().all() == []
+
+
 def test_manager_without_department_cannot_create_customer(db):
     """无部门主管建客户会造出"owner 有值、department 为空"的孤儿行。
 
     这类客户既不在公海、也不在任何部门作用域里，连 owner 自己都看不到；
     ``None != None`` 放行是根因，必须 400 拒绝而不是静默落库。
     """
-    _setup(db)
+    f = _setup(db)
     void = create_user(
         db,
         username="boss_void",
         password=PASSWORD,
         display_name="无部门主管",
         role=ROLE_MANAGER,
-        department_id=None,
+        department_id=f["east"].id,
     )
+    # 建号路径已经禁止无部门主管；这里模拟历史数据/人工改库留下的无部门状态，
+    # 客户创建路径仍必须自己兜住。
+    db.execute(
+        text("UPDATE users SET department_id = NULL WHERE id = :user_id"),
+        {"user_id": void.id},
+    )
+    db.commit()
+    db.refresh(void)
 
     with pytest.raises(InvalidValueError) as exc:
         create_customer(db, void, CustomerCreate(name="甲公司"))
