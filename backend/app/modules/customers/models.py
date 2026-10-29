@@ -5,11 +5,15 @@
 """
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, SoftDeleteMixin, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.modules.users.models import User
 
 PROCUREMENT_TYPES = ("tender", "direct", "framework", "other")
 BUDGET_STATUSES = ("approved", "pending", "none", "unknown")
@@ -55,6 +59,13 @@ class Customer(Base, TimestampMixin, SoftDeleteMixin):
     remark: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("users.id"), nullable=True
+    )
+
+    # 负责人关系只服务于 CustomerRead.owner_name（详情页显示姓名，销售/主管读不到
+    # /users 名录）。lazy="raise"：任何没预加载就访问 .owner 的地方立刻报错，
+    # 不让它退化成逐条回查 users 的 N+1。读取入口统一 joinedload，见 service。
+    owner: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[owner_id], lazy="raise"
     )
 
     # 命名约定里的 ix 模板是 %(column_0_label)s，表达式索引会与普通列索引撞名，

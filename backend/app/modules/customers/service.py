@@ -20,7 +20,7 @@ import unicodedata
 from datetime import UTC, datetime
 
 from sqlalchemy import Select, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.errors import (
     ConflictError,
@@ -183,6 +183,21 @@ def _resolve_owner(
     return owner
 
 
+def _reload_with_owner(db: Session, customer: Customer) -> Customer:
+    """写完回读一次，同时刷新列值与负责人关系。
+
+    ``Customer.owner`` 是 ``lazy="raise"``：响应序列化要读 ``owner_name``，不预加
+    载就会直接报错。这里用一条 join 查询代替原来的 ``db.refresh``，SQL 次数不变。
+    """
+    customer_id = customer.id
+    return db.execute(
+        select(Customer)
+        .options(joinedload(Customer.owner))
+        .where(Customer.id == customer_id)
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+
 def create_customer(db: Session, actor: User, payload: CustomerCreate) -> Customer:
     name = payload.name.strip()
     if not name:
@@ -228,8 +243,7 @@ def create_customer(db: Session, actor: User, payload: CustomerCreate) -> Custom
     )
     db.add(customer)
     db.commit()
-    db.refresh(customer)
-    return customer
+    return _reload_with_owner(db, customer)
 
 
 def list_customers(
@@ -277,6 +291,10 @@ def list_customers(
 
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
 
+    # 负责人姓名随列表一起返回：一条 LEFT JOIN 取回，20 条客户也只多这一次 join，
+    # 不会退化成每条再查一次 users。放在 count 之后，避免总数 SQL 也带上这个 join。
+    stmt = stmt.options(joinedload(Customer.owner))
+
     normalized = sort.strip() or "-created_at"
     descending = normalized.startswith("-")
     field = normalized.lstrip("-")
@@ -298,7 +316,9 @@ def get_customer(db: Session, actor: User, customer_id: int) -> Customer:
     把 403 与 404 分开，前端才能区分"没权限"与"记录没了"。
     """
     customer = db.execute(
-        customer_query(actor).where(Customer.id == customer_id)
+        customer_query(actor)
+        .options(joinedload(Customer.owner))
+        .where(Customer.id == customer_id)
     ).scalar_one_or_none()
     if customer is not None:
         return customer
@@ -341,8 +361,7 @@ def update_customer(
     for field, value in changes.items():
         setattr(customer, field, value)
     db.commit()
-    db.refresh(customer)
-    return customer
+    return _reload_with_owner(db, customer)
 
 
 def delete_customer(db: Session, actor: User, customer_id: int) -> None:

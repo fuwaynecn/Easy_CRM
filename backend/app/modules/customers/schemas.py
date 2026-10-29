@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CustomerCreate(BaseModel):
@@ -79,11 +80,36 @@ class CustomerRead(BaseModel):
     budget_status: str
     status: str
     owner_id: int | None
+    # 负责人姓名：只有能读到该客户的人才看得到，权限不因为多返回一个名字而变化。
+    # 公海客户（owner_id IS NULL）为 None。值来自 User.display_name，不额外开放
+    # /users 名录——销售/主管本来就读不到那张表。
+    owner_name: str | None = None
     department_id: int | None
     last_activity_at: datetime | None
     remark: str | None
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_owner_name(cls, data: Any) -> Any:
+        """从 ORM 的 ``owner`` 关系补 ``owner_name``。
+
+        不用 ``computed_field``：``from_attributes`` 只按字段名读同一个对象的属性，
+        读不到关系另一张表上的列，必须在验证前把姓名摆成一个键。``owner`` 由服务层
+        用 ``joinedload`` 预加载（关系是 ``lazy="raise"``，漏预加载会立刻报错而不是
+        静默 N+1）。
+        """
+        if isinstance(data, (dict, cls)):
+            return data
+        owner = getattr(data, "owner", None)
+        values = {
+            field: getattr(data, field)
+            for field in cls.model_fields
+            if field != "owner_name"
+        }
+        values["owner_name"] = owner.display_name if owner is not None else None
+        return values
 
 
 class CustomerBrief(BaseModel):

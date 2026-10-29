@@ -11,7 +11,8 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
+from sqlalchemy.orm import Session
 
 from app.core.errors import (
     ConflictError,
@@ -592,6 +593,35 @@ def test_list_customers_excludes_soft_deleted(db):
     assert total == 0 and items == []
 
 
+def test_list_customers_eager_loads_owner_without_n_plus_one(db):
+    """取 20 条客户只允许两条 SELECT：总数 + 分页（负责人随分页一条 join 取回）。
+
+    用独立 Session 查询，避开身份映射里已有的 Customer/User 实例：否则即使服务层
+    删掉预加载，测试也会因为对象已在内存里而变绿。访问 ``owner`` 也放在计数区间内：
+    预加载被删掉时，要么直接报错（``lazy="raise"``），要么多出 20 条 SELECT。
+    """
+    f = _setup(db)
+    for i in range(20):
+        create_customer(db, f["sa"], CustomerCreate(name=f"客户{i}", force=True))
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        with Session(bind=engine) as fresh:
+            items, total = list_customers(fresh, f["sa"])
+            assert total == 20
+            assert {item.owner.display_name for item in items} == {"销售A"}
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert len(statements) <= 2, "\n".join(statements)
+
+
 # --- 详情：越权 403、不存在 404 -----------------------------------------
 
 
@@ -810,6 +840,47 @@ def test_api_list_scoped_to_own_and_pool(client, db):
     assert body["total"] == 2
     assert {item["name"] for item in body["items"]} == {"甲公司", "公海公司"}
     assert pool.id in {item["id"] for item in body["items"]}
+
+
+def test_api_list_and_detail_expose_owner_name(client, db):
+    """列表与详情都返回负责人的 display_name；公海客户（没有负责人）是 null。"""
+    f = _setup(db)
+    mine = create_customer(db, f["sa"], CustomerCreate(name="甲公司"))
+    pool = create_customer(db, f["admin"], CustomerCreate(name="公海公司"))
+    headers = _auth(_token(client, "sales_a"))
+
+    body = client.get("/api/v1/customers", headers=headers).json()
+    names = {item["id"]: item["owner_name"] for item in body["items"]}
+    assert names == {mine.id: "销售A", pool.id: None}
+
+    detail = client.get(f"/api/v1/customers/{mine.id}", headers=headers).json()
+    assert detail["owner_name"] == "销售A"
+    pool_detail = client.get(f"/api/v1/customers/{pool.id}", headers=headers).json()
+    assert pool_detail["owner_name"] is None
+
+    # 主管看下属名下的客户也拿得到姓名，不是"只有自己"的特例
+    boss_detail = client.get(
+        f"/api/v1/customers/{mine.id}", headers=_auth(_token(client, "boss"))
+    ).json()
+    assert boss_detail["owner_name"] == "销售A"
+
+
+def test_api_create_and_patch_return_owner_name(client, db):
+    """写接口同样带 owner_name：单条路径的回读也必须预加载负责人。"""
+    _setup(db)
+    headers = _auth(_token(client, "sales_a"))
+
+    created = client.post("/api/v1/customers", headers=headers, json={"name": "甲公司"})
+    assert created.status_code == 201, created.text
+    assert created.json()["owner_name"] == "销售A"
+
+    patched = client.patch(
+        f"/api/v1/customers/{created.json()['id']}",
+        headers=headers,
+        json={"level": "A"},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["owner_name"] == "销售A"
 
 
 def test_api_detail_of_other_sales_customer_returns_403(client, db):
