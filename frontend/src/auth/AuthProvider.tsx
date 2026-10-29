@@ -15,6 +15,18 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState | null>(null);
 
+/**
+ * 登录返回 200 但响应结构不符合契约：这是**前端**发现的契约错误，不是服务端故障。
+ * 用 `ApiError` 的 `status = 0`（"没有 HTTP 状态码"）承载：既保留统一的 `ApiError`
+ * 处理路径（`LoginPage` 用 `errorMessage` 取中文文案），又不会被 `App.tsx` 的重试判定
+ * 当成 5xx 去重试一次注定一样的结果。
+ */
+class InvalidLoginResponseError extends ApiError {
+  constructor() {
+    super(0, "invalid_response", "登录响应异常，请稍后重试");
+  }
+}
+
 /** 后端返回 200 但结构不对时，不能直接信任类型断言的结果。 */
 function isLoginResult(value: unknown): value is LoginResult {
   if (typeof value !== "object" || value === null) return false;
@@ -86,7 +98,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!isLoginResult(result)) {
           setAccessToken(null);
           setUser(null);
-          throw new ApiError(500, "invalid_response", "登录响应异常，请稍后重试");
+          throw new InvalidLoginResponseError();
         }
         setAccessToken(result.access_token);
         setUser(result.user);

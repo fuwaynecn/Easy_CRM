@@ -10,28 +10,14 @@ import type { Contact, Customer } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
 import { Field, TextArea } from "../components/Field";
 import { Modal } from "../components/Modal";
-
-const BUDGET_LABEL: Record<string, string> = {
-  approved: "已立项",
-  pending: "预算未批",
-  none: "无预算",
-  unknown: "未知",
-};
-
-const PROCUREMENT_LABEL: Record<string, string> = {
-  tender: "招标",
-  direct: "直采",
-  framework: "框架协议",
-  other: "其他",
-};
-
-const DECISION_LABEL: Record<string, string> = {
-  decision_maker: "决策人",
-  tech: "技术负责人",
-  purchase: "采购",
-  user: "使用者",
-  other: "其他",
-};
+import { QueryError } from "../components/QueryError";
+import {
+  BUDGET_STATUS_LABELS,
+  DECISION_ROLE_LABELS,
+  DECISION_ROLE_OPTIONS,
+  PROCUREMENT_TYPE_LABELS,
+  labelOf,
+} from "../constants/customerLabels";
 
 /**
  * 与后端 `EmailStr` 的底线一致（域名必须有点）。前端先拦一次，只为少一次
@@ -277,31 +263,18 @@ export default function CustomerDetailPage() {
   }
 
   if (customerQuery.isError) {
-    // 403 分支照抄列表页（CustomerListPage.tsx:157-176）：只给一句中文提示，
-    // 不渲染任何客户字段（连公司名都不能出现），不重试、不登出、不跳登录页。
-    const forbidden = customerQuery.error instanceof ApiError && customerQuery.error.status === 403;
+    // 错误块与列表页共用 QueryError：403 只给一句中文提示，不渲染任何客户字段
+    // （连公司名都不能出现），不重试、不登出、不跳登录页。
     return (
-      <div className="space-y-3">
-        <div className="rounded-lg border border-slate-200 bg-white p-4 text-sm">
-          <p className="break-words text-red-600">
-            {forbidden
-              ? errorMessage(customerQuery.error, "无权查看该客户")
-              : errorMessage(customerQuery.error, "客户不存在或加载失败")}
-          </p>
-          {forbidden ? null : (
-            <button
-              type="button"
-              onClick={() => void customerQuery.refetch()}
-              className="mt-2 rounded border border-slate-300 px-2 py-1"
-            >
-              重试
-            </button>
-          )}
-          <Link to="/customers" className="mt-2 block text-brand-600 hover:underline">
-            返回客户列表
-          </Link>
-        </div>
-      </div>
+      <QueryError
+        error={customerQuery.error}
+        fallback="客户不存在或加载失败"
+        onRetry={() => void customerQuery.refetch()}
+      >
+        <Link to="/customers" className="mt-2 block text-brand-600 hover:underline">
+          返回客户列表
+        </Link>
+      </QueryError>
     );
   }
 
@@ -448,14 +421,14 @@ export default function CustomerDetailPage() {
                 <dt className="text-slate-500">采购方式</dt>
                 <dd className="mt-0.5 break-words">
                   {customer.procurement_type
-                    ? (PROCUREMENT_LABEL[customer.procurement_type] ?? customer.procurement_type)
+                    ? labelOf(PROCUREMENT_TYPE_LABELS, customer.procurement_type)
                     : "—"}
                 </dd>
               </div>
               <div className="min-w-0">
                 <dt className="text-slate-500">预算状态</dt>
                 <dd className="mt-0.5 break-words">
-                  {BUDGET_LABEL[customer.budget_status] ?? customer.budget_status}
+                  {labelOf(BUDGET_STATUS_LABELS, customer.budget_status)}
                 </dd>
               </div>
               <div className="min-w-0">
@@ -514,7 +487,7 @@ export default function CustomerDetailPage() {
               <ul className="divide-y divide-slate-100">
                 {contacts.map((contact) => {
                   const role = contact.decision_role
-                    ? (DECISION_LABEL[contact.decision_role] ?? contact.decision_role)
+                    ? labelOf(DECISION_ROLE_LABELS, contact.decision_role)
                     : null;
                   const meta = [contact.title, role]
                     .filter((part): part is string => typeof part === "string" && part !== "")
@@ -636,11 +609,11 @@ export default function CustomerDetailPage() {
                 className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
               >
                 <option value="">未填</option>
-                <option value="decision_maker">决策人</option>
-                <option value="tech">技术负责人</option>
-                <option value="purchase">采购</option>
-                <option value="user">使用者</option>
-                <option value="other">其他</option>
+                {DECISION_ROLE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
             <div>

@@ -4,10 +4,6 @@ export function setAccessToken(token: string | null): void {
   accessToken = token;
 }
 
-export function getAccessToken(): string | null {
-  return accessToken;
-}
-
 /**
  * “会话彻底失效”回调：仅在上层状态需要同步清理时使用。
  * 回调内不得再发起请求（会再次触发本回调，形成递归）。

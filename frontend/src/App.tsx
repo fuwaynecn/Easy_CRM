@@ -12,10 +12,11 @@ import LoginPage from "./pages/LoginPage";
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      // 4xx 是确定性错误（403 越权、404 不存在、422 参数不合规），重试只会让用户
-      // 多等一次同样的失败；只对网络异常与 5xx 重试一次。
+      // 只有 5xx 与网络异常值得重试：4xx 是确定性错误（403 越权、404 不存在、422 参数
+      // 不合规），重试只会让用户多等一次同样的失败；status = 0 是前端自产的契约错误
+      // （登录响应结构不对，见 AuthProvider），同样不重试。
       retry: (failureCount, error) =>
-        failureCount < 1 && !(error instanceof ApiError && error.status < 500),
+        failureCount < 1 && (!(error instanceof ApiError) || error.status >= 500),
       refetchOnWindowFocus: false,
     },
   },

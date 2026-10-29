@@ -6,20 +6,29 @@ import { ApiError, errorMessage } from "../api/client";
 import { createCustomer, listCustomers } from "../api/customers";
 import { Field, TextArea } from "../components/Field";
 import { Modal } from "../components/Modal";
+import { QueryError } from "../components/QueryError";
+import {
+  BUDGET_STATUS_LABELS,
+  BUDGET_STATUS_OPTIONS,
+  LEVEL_LABELS,
+  LEVEL_OPTIONS,
+  PROCUREMENT_TYPE_LABELS,
+  PROCUREMENT_TYPE_OPTIONS,
+  labelOf,
+} from "../constants/customerLabels";
 
-const LEVEL_LABEL: Record<string, string> = { A: "A 级", B: "B 级", C: "C 级" };
-const BUDGET_LABEL: Record<string, string> = {
-  approved: "已立项",
-  pending: "预算未批",
-  none: "无预算",
-  unknown: "未知",
-};
-const PROCUREMENT_LABEL: Record<string, string> = {
-  tender: "招标",
-  direct: "直采",
-  framework: "框架协议",
-  other: "其他",
-};
+/**
+ * 移动卡片上的「最后跟进」文案：null 显示「未跟进」，有值只给「月-日」。
+ * 375px 下这一行还要放负责人，完整年月日既放不下也没必要（跨年歧义见报告）。
+ */
+function lastFollowUpText(value: string | null): string {
+  if (value === null) return "未跟进";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `最后跟进 ${month}-${day}`;
+}
 
 // 公海徽标。判定只有一条：owner_id === null（与详情页 publicPool/writable 同一口径）。
 // 只给公海客户标记——自己名下的客户不标，否则「每行都有标签」等于没有标签。
@@ -104,8 +113,6 @@ export default function CustomerListPage() {
   // 页码一律以服务端回显为准（后端可能把越界页钳制回最后一页）。
   const currentPage = data?.page ?? page;
   const pageCount = Math.max(1, Math.ceil((data?.total ?? 0) / Math.max(1, data?.page_size ?? 20)));
-  // 403 是"看得到记录但没权限"，必须只显示提示、不渲染任何客户字段。
-  const forbidden = query.error instanceof ApiError && query.error.status === 403;
 
   // 每次打开弹窗都从干净状态开始：否则上一次的报错/重复提示会跟着新表单进来，
   // 按钮还显示「确认仍要创建」，而那是针对上一次名称的授权。
@@ -151,9 +158,11 @@ export default function CustomerListPage() {
           className="rounded-md border border-slate-300 px-3 py-2 text-sm"
         >
           <option value="">全部等级</option>
-          <option value="A">A 级</option>
-          <option value="B">B 级</option>
-          <option value="C">C 级</option>
+          {LEVEL_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
         </select>
         <button
           type="button"
@@ -168,23 +177,12 @@ export default function CustomerListPage() {
 
       {query.isError ? (
         // 403 不登出、不跳登录页，只在本页给中文提示；也不给重试（重试同样的
-        // 越权请求只会再失败一次）。
-        <div className="rounded-lg border border-slate-200 bg-white p-4 text-sm">
-          <p className="break-words text-red-600">
-            {forbidden
-              ? errorMessage(query.error, "无权查看该客户")
-              : errorMessage(query.error, "加载失败，请重试")}
-          </p>
-          {forbidden ? null : (
-            <button
-              type="button"
-              onClick={() => void query.refetch()}
-              className="mt-2 rounded border border-slate-300 px-2 py-1"
-            >
-              重试
-            </button>
-          )}
-        </div>
+        // 越权请求只会再失败一次）。只有 5xx / 网络异常才出重试按钮，见 QueryError。
+        <QueryError
+          error={query.error}
+          fallback="加载失败，请重试"
+          onRetry={() => void query.refetch()}
+        />
       ) : null}
 
       {/* 出错时连占位数据一起藏起来：状态切换期间不能把上一个查询的客户字段留在屏幕上。 */}
@@ -203,6 +201,9 @@ export default function CustomerListPage() {
               <thead className="bg-slate-50 text-left text-slate-500">
                 <tr>
                   <th className="px-3 py-2 font-medium">客户名称</th>
+                  {/* 负责人紧挨客户名称：主管看到的列表里混着下属的客户，没有名字时
+                      「无公海徽标」会被读成「我的客户」。 */}
+                  <th className="px-3 py-2 font-medium">负责人</th>
                   <th className="px-3 py-2 font-medium">等级</th>
                   <th className="px-3 py-2 font-medium">地区</th>
                   <th className="px-3 py-2 font-medium">采购方式</th>
@@ -224,15 +225,18 @@ export default function CustomerListPage() {
                         {c.owner_id === null ? <PublicPoolBadge /> : null}
                       </div>
                     </td>
-                    <td className="px-3 py-2">{LEVEL_LABEL[c.level] ?? c.level}</td>
+                    <td className="break-words px-3 py-2 text-slate-600">
+                      {c.owner_name ?? "未分配"}
+                    </td>
+                    <td className="px-3 py-2">{labelOf(LEVEL_LABELS, c.level)}</td>
                     <td className="px-3 py-2 text-slate-600">{c.region ?? "—"}</td>
                     <td className="px-3 py-2 text-slate-600">
                       {c.procurement_type
-                        ? (PROCUREMENT_LABEL[c.procurement_type] ?? c.procurement_type)
+                        ? labelOf(PROCUREMENT_TYPE_LABELS, c.procurement_type)
                         : "—"}
                     </td>
                     <td className="px-3 py-2 text-slate-600">
-                      {BUDGET_LABEL[c.budget_status] ?? c.budget_status}
+                      {labelOf(BUDGET_STATUS_LABELS, c.budget_status)}
                     </td>
                   </tr>
                 ))}
@@ -252,7 +256,7 @@ export default function CustomerListPage() {
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <span className="min-w-0 break-words font-medium text-slate-900">{c.name}</span>
                   <span className="shrink-0 text-xs text-slate-500">
-                    {LEVEL_LABEL[c.level] ?? c.level}
+                    {labelOf(LEVEL_LABELS, c.level)}
                   </span>
                 </div>
                 {/* 徽标放在第二行（region · budget 那一行）而不是名称行：375px 下名称
@@ -261,8 +265,15 @@ export default function CustomerListPage() {
                 <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
                   {c.owner_id === null ? <PublicPoolBadge /> : null}
                   <span className="min-w-0 break-words">
-                    {c.region ?? "—"} · {BUDGET_LABEL[c.budget_status] ?? c.budget_status}
+                    {c.region ?? "—"} · {labelOf(BUDGET_STATUS_LABELS, c.budget_status)}
                   </span>
+                </div>
+                {/* spec §6.3：移动卡片要显示负责人与最后跟进时间。单独一行 + flex-wrap，
+                    长负责人名换行而不是把卡片顶宽；`shrink-0` 只给短的跟进时间，避免它
+                    被压成半截日期。 */}
+                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+                  <span className="min-w-0 break-words">负责人：{c.owner_name ?? "未分配"}</span>
+                  <span className="shrink-0">{lastFollowUpText(c.last_activity_at)}</span>
                 </div>
               </Link>
             ))}
@@ -338,9 +349,11 @@ export default function CustomerListPage() {
                   onChange={(e) => setForm({ ...form, level: e.target.value })}
                   className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
                 >
-                  <option value="A">A</option>
-                  <option value="B">B</option>
-                  <option value="C">C</option>
+                  {LEVEL_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
               </label>
               <label className="block">
@@ -351,10 +364,11 @@ export default function CustomerListPage() {
                   className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
                 >
                   <option value="">未填</option>
-                  <option value="tender">招标</option>
-                  <option value="direct">直采</option>
-                  <option value="framework">框架协议</option>
-                  <option value="other">其他</option>
+                  {PROCUREMENT_TYPE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
               </label>
               <label className="block">
@@ -364,10 +378,11 @@ export default function CustomerListPage() {
                   onChange={(e) => setForm({ ...form, budget_status: e.target.value })}
                   className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
                 >
-                  <option value="approved">已立项</option>
-                  <option value="pending">预算未批</option>
-                  <option value="none">无预算</option>
-                  <option value="unknown">未知</option>
+                  {BUDGET_STATUS_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
               </label>
             </div>
