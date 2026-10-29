@@ -36,6 +36,20 @@ _REQUIRED_FIELDS = {"name": "联系人姓名", "is_primary": "是否主联系人
 # 数据冲突"（409），不是服务端错误（500）：提示用户刷新后重试即可。
 _PRIMARY_CONFLICT_MESSAGE = "该客户已有主联系人，请刷新后重试"
 
+# 只有这条约束才翻译成上面的 409。将来加别的唯一约束时，如果这里不做区分，
+# 每一条都会提示"主联系人冲突"，用户按提示去改主联系人却怎么都修不好。
+_PRIMARY_CONSTRAINT_NAME = "uq_contacts_customer_primary"
+
+
+def _is_primary_conflict(exc: IntegrityError) -> bool:
+    """异常是否来自主联系人部分唯一索引。
+
+    直接匹配约束名而不是按 SQLSTATE 一律映射：后者的范围和"所有 IntegrityError"
+    一样宽，分不出是哪条约束。``exc.orig`` 是驱动层异常（psycopg 的 message 里带
+    约束名），取不到时退回匹配整个异常文本。
+    """
+    return _PRIMARY_CONSTRAINT_NAME in str(exc.orig or exc)
+
 
 def _validate_decision_role(role: str | None) -> None:
     """取值不在字典里是 400（同客户模块的枚举口径）。
@@ -130,8 +144,11 @@ def create_contact(
         db.commit()
     except IntegrityError as exc:
         # 并发下另一个事务已经设了主联系人：唯一索引替我们兜住了坏数据，
-        # 这里把"撞约束"翻译成可重试的 409。
+        # 这里把"撞约束"翻译成可重试的 409。其它约束原样抛（500），
+        # 不能伪装成主联系人冲突让人按错误提示去修。
         db.rollback()
+        if not _is_primary_conflict(exc):
+            raise
         raise ConflictError(_PRIMARY_CONFLICT_MESSAGE) from exc
     db.refresh(contact)
     return contact
@@ -169,8 +186,11 @@ def update_contact(
     try:
         db.commit()
     except IntegrityError as exc:
-        # 同 create_contact：并发把两个联系人设成主联系人，后提交者在这里收口。
+        # 同 create_contact：并发把两个联系人设成主联系人，后提交者在这里收口；
+        # 非主联系人约束原样抛，不翻译成 409。
         db.rollback()
+        if not _is_primary_conflict(exc):
+            raise
         raise ConflictError(_PRIMARY_CONFLICT_MESSAGE) from exc
     db.refresh(contact)
     return contact

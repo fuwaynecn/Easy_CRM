@@ -333,6 +333,35 @@ def test_concurrent_primary_update_returns_409(db, monkeypatch):
     assert db.get(Contact, second.id).is_primary is False
 
 
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_non_primary_integrity_error_is_not_mapped_to_409(db, operation):
+    """错误映射按约束名细分：别的唯一约束原样抛（500），不能伪装成 409 主联系人冲突。
+
+    临时加一条唯一索引制造真实的 psycopg IntegrityError——异常文本里带的是
+    ``uq_contacts_wechat_tmp``，与主联系人的约束名无关；若服务层还按"所有
+    IntegrityError"映射，这里会拿到 ConflictError 而不是 IntegrityError。
+    """
+    f = _setup(db)
+    db.execute(text("CREATE UNIQUE INDEX uq_contacts_wechat_tmp ON contacts (wechat)"))
+    db.commit()
+    create_contact(
+        db, f["sa"], f["cust_a"].id, ContactCreate(name="王工", wechat="wx-1")
+    )
+    second = create_contact(
+        db, f["sa"], f["cust_a"].id, ContactCreate(name="李工", wechat="wx-2")
+    )
+
+    with pytest.raises(IntegrityError) as exc:
+        if operation == "create":
+            create_contact(
+                db, f["sa"], f["cust_a"].id, ContactCreate(name="张工", wechat="wx-1")
+            )
+        else:
+            update_contact(db, f["sa"], second.id, ContactUpdate(wechat="wx-1"))
+
+    assert "uq_contacts_wechat_tmp" in str(exc.value)
+
+
 def test_soft_deleted_primary_frees_the_slot(db):
     """主联系人删掉后可以再设一个：约束条件带 deleted_at IS NULL。"""
     f = _setup(db)
