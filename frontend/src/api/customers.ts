@@ -21,6 +21,9 @@ export interface CustomerCreateBody {
   name: string;
   industry?: string;
   region?: string;
+  // 创建表单暂未收集地址，但后端 CustomerCreate 与 CustomerUpdate 都接受它；
+  // 详情页的就地编辑只提交 address/remark（其余字段不传 = 保持不变）。
+  address?: string;
   level?: string;
   procurement_type?: string;
   budget_status?: string;
