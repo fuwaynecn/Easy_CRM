@@ -4,3 +4,4 @@
 """
 
 from app.modules.departments.models import Department  # noqa: F401
+from app.modules.users.models import User  # noqa: F401
