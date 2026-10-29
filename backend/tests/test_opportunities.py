@@ -16,15 +16,22 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
+from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
 from app.modules.lost_reasons.schemas import LostReasonCreate
 from app.modules.lost_reasons.service import create_lost_reason
 from app.modules.opportunities.models import Opportunity, StageHistory
-from app.modules.opportunities.schemas import OpportunityCreate, OpportunityUpdate
+from app.modules.opportunities.schemas import (
+    OpportunityCreate,
+    OpportunityRead,
+    OpportunityUpdate,
+    StageChange,
+)
 from app.modules.opportunities.service import (
     board,
+    change_stage,
     create_opportunity,
     delete_opportunity,
     get_opportunity,
@@ -574,3 +581,291 @@ def test_sync_owner_skips_deleted_opportunities(db):
     assert sync_opportunity_owner(
         db, customer_id=f["cust_a"].id, owner_id=f["sc"].id
     ) == 0
+
+
+# --- 阶段变更 ------------------------------------------------------------
+
+
+def test_stage_forward_writes_history_with_snapshot(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"], amount=Decimal(1200))
+
+    changed = change_stage(
+        db, f["sa"], opportunity.id, StageChange(stage="needs", note="需求已确认")
+    )
+
+    assert changed.stage == "needs"
+    rows = _history_rows(db, opportunity.id)
+    assert [(row.from_stage, row.to_stage) for row in rows] == [
+        (None, "contact"),
+        ("contact", "needs"),
+    ]
+    assert str(rows[-1].amount_snapshot) == "1200.00"
+    assert rows[-1].note == "需求已确认"
+    assert rows[-1].operator_id == f["sa"].id
+
+
+def test_stage_jump_and_backward_are_allowed(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+
+    change_stage(db, f["sa"], opportunity.id, StageChange(stage="negotiation"))
+    changed = change_stage(db, f["sa"], opportunity.id, StageChange(stage="contact"))
+
+    assert changed.stage == "contact"
+    rows = _history_rows(db, opportunity.id)
+    assert [row.to_stage for row in rows] == ["contact", "negotiation", "contact"]
+
+
+def test_same_stage_is_invalid_and_writes_nothing(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(InvalidValueError):
+        change_stage(db, f["sa"], opportunity.id, StageChange(stage="contact"))
+
+    assert len(_history_rows(db, opportunity.id)) == 1     # 只有创建那一条
+
+
+def test_unknown_target_stage_is_invalid(db):
+    """未知阶段是 400，而不是落库撞 CHECK 变 500；也不写 history。"""
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(InvalidValueError) as excinfo:
+        change_stage(db, f["sa"], opportunity.id, StageChange(stage="prospecting"))
+
+    assert excinfo.value.code == "invalid_value"
+    assert len(_history_rows(db, opportunity.id)) == 1
+
+
+def test_won_sets_won_at(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+
+    changed = change_stage(db, f["sa"], opportunity.id, StageChange(stage="won"))
+
+    assert changed.stage == "won"
+    assert changed.won_at is not None
+    assert changed.lost_reason_id is None
+
+
+def test_lost_requires_reason(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(InvalidValueError):
+        change_stage(db, f["sa"], opportunity.id, StageChange(stage="lost"))
+
+    with pytest.raises(NotFoundError):
+        change_stage(
+            db, f["sa"], opportunity.id, StageChange(stage="lost", lost_reason_id=999)
+        )
+
+
+def test_lost_records_reason_and_note(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    reason = create_lost_reason(db, LostReasonCreate(name="客户选择了竞品"))
+
+    changed = change_stage(
+        db,
+        f["sa"],
+        opportunity.id,
+        StageChange(
+            stage="lost", lost_reason_id=reason.id, lost_note="对手报价低 15%"
+        ),
+    )
+
+    assert changed.lost_reason_id == reason.id
+    assert changed.lost_note == "对手报价低 15%"
+    assert changed.won_at is None
+
+
+def test_reason_on_non_lost_stage_is_rejected(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    reason = create_lost_reason(db, LostReasonCreate(name="价格过高"))
+
+    with pytest.raises(InvalidValueError):
+        change_stage(
+            db,
+            f["sa"],
+            opportunity.id,
+            StageChange(stage="proposal", lost_reason_id=reason.id),
+        )
+
+
+def test_lost_with_inactive_reason_is_rejected(db):
+    """停用的输单原因已经不在选择器里，绝不能再给新单挂上。
+
+    `active` 只有在某个写入口真的看它时才不是装饰品：P2 没有字典管理界面，
+    停用只能靠 SQL/运维做，如果阶段变更不看这一列，停用就完全不起作用。
+    """
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    reason = create_lost_reason(db, LostReasonCreate(name="项目延期搁置"))
+    reason.active = False
+    db.commit()
+
+    with pytest.raises(InvalidValueError) as excinfo:
+        change_stage(
+            db,
+            f["sa"],
+            opportunity.id,
+            StageChange(stage="lost", lost_reason_id=reason.id),
+        )
+
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.code == "invalid_value"
+    assert "已停用" in excinfo.value.message
+    # 被拒的变更不能留下任何痕迹：机会还在原阶段，history 仍只有创建那一条
+    db.expire_all()
+    assert db.get(Opportunity, opportunity.id).stage == "contact"
+    assert len(_history_rows(db, opportunity.id)) == 1
+
+
+def test_terminal_to_terminal_is_rejected(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    change_stage(db, f["sa"], opportunity.id, StageChange(stage="won"))
+
+    with pytest.raises(InvalidValueError):
+        change_stage(
+            db, f["sa"], opportunity.id, StageChange(stage="lost", lost_reason_id=1)
+        )
+
+
+def test_reopen_requires_manager_and_note(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    change_stage(db, f["sa"], opportunity.id, StageChange(stage="won"))
+
+    # 销售不能重开自己赢的单
+    with pytest.raises(ForbiddenError):
+        change_stage(
+            db, f["sa"], opportunity.id, StageChange(stage="negotiation", note="客户追加预算")
+        )
+
+    # 主管必须填原因
+    with pytest.raises(InvalidValueError):
+        change_stage(db, f["boss"], opportunity.id, StageChange(stage="negotiation"))
+
+    reopened = change_stage(
+        db,
+        f["boss"],
+        opportunity.id,
+        StageChange(stage="negotiation", note="客户追加预算"),
+    )
+
+    assert reopened.stage == "negotiation"
+    assert reopened.won_at is None              # 重开必须清掉终态时间，否则报表还算它赢
+    rows = _history_rows(db, opportunity.id)
+    assert (rows[-1].from_stage, rows[-1].to_stage) == ("won", "negotiation")
+    assert rows[-1].note == "客户追加预算"
+
+
+def test_reopen_lost_clears_reason(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    reason = create_lost_reason(db, LostReasonCreate(name="价格过高"))
+    change_stage(
+        db, f["sa"], opportunity.id, StageChange(stage="lost", lost_reason_id=reason.id)
+    )
+
+    reopened = change_stage(
+        db, f["boss"], opportunity.id,
+        StageChange(stage="needs", note="客户预算回来了"),
+    )
+
+    assert reopened.stage == "needs"
+    assert reopened.lost_reason_id is None
+    assert reopened.lost_note is None
+
+
+def test_stage_change_does_not_touch_customer_last_activity(db):
+    """design §3.3 的三条同步点里没有"改阶段"：顺手刷新会让公海回收永远不生效。"""
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    before = f["cust_a"].last_activity_at
+
+    change_stage(db, f["sa"], opportunity.id, StageChange(stage="proposal"))
+
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at == before
+
+
+def test_last_activity_survives_every_transition(db):
+    """上一条的强化版：客户已有**确定的时间戳**时，任何一次写入都会露馅。
+
+    `last_activity_at` 为 None 时，"改完还是 None"几乎不可能失败——而"顺手刷成
+    now()"这种最常见的写坏方式恰好被 None 掩盖。这里先落一个旧时间戳，再把
+    推进、赢单、重开、输单四条路径都走一遍。
+    """
+    f = _setup(db)
+    stamped = datetime(2026, 1, 15, 8, 0, tzinfo=UTC)
+    f["cust_a"].last_activity_at = stamped
+    db.commit()
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    reason = create_lost_reason(db, LostReasonCreate(name="价格过高"))
+
+    path = [
+        (f["sa"], StageChange(stage="proposal")),
+        (f["sa"], StageChange(stage="won")),
+        (f["boss"], StageChange(stage="negotiation", note="客户追加预算")),
+        (f["sa"], StageChange(stage="lost", lost_reason_id=reason.id)),
+    ]
+    for actor, payload in path:
+        change_stage(db, actor, opportunity.id, payload)
+        db.expire_all()
+        assert db.get(Customer, f["cust_a"].id).last_activity_at == stamped
+
+
+def test_manual_win_rate_survives_stage_change(db):
+    f = _setup(db)
+    manual = _make(db, f["sa"], f["cust_a"], name="手填", win_rate=85)
+    auto = _make(db, f["sa"], f["cust_a"], name="自动")
+
+    change_stage(db, f["sa"], manual.id, StageChange(stage="proposal"))
+    change_stage(db, f["sa"], auto.id, StageChange(stage="proposal"))
+
+    db.expire_all()
+    assert db.get(Opportunity, manual.id).win_rate == 85        # 手改值不被覆盖
+    assert db.get(Opportunity, auto.id).win_rate is None        # 自动值仍跟随阶段
+
+
+def test_win_rate_set_by_patch_is_kept_as_manual_after_stage_change(db):
+    """手改值从 PATCH 进来，随后改阶段：库里、生效值、`win_rate_manual` 三者一致。
+
+    `win_rate` 列是 NULL=跟随阶段 的单一真值源，因此"改阶段不覆盖手改值"只用一条
+    断言钉在列上还不够：响应里的 `win_rate_manual` 一旦算错（例如写成 `bool(生效值)`），
+    前端就会把跟随阶段的机会显示成"手工 30%"，编辑框再也回不到「跟随阶段」。
+    """
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+
+    update_opportunity(db, f["sa"], opportunity.id, OpportunityUpdate(win_rate=42))
+    changed = change_stage(db, f["sa"], opportunity.id, StageChange(stage="proposal"))
+
+    assert changed.win_rate == 42
+    read = OpportunityRead.model_validate(changed)
+    assert read.win_rate == 42
+    assert read.win_rate_manual is True
+
+
+def test_stage_change_on_foreign_opportunity_is_403(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sb"], f["cust_b"], name="乙公司机会")
+
+    with pytest.raises(ForbiddenError):
+        change_stage(db, f["sa"], opportunity.id, StageChange(stage="needs"))
+
+
+def test_stage_change_on_deleted_opportunity_is_404(db):
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"])
+    opportunity.deleted_at = datetime.now(UTC)
+    db.commit()
+
+    with pytest.raises(NotFoundError):
+        change_stage(db, f["sa"], opportunity.id, StageChange(stage="needs"))
