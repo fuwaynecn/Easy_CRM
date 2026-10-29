@@ -3,4 +3,4 @@
 新增模型时，必须在这里追加一行导入，否则测试夹具建表会缺表。
 """
 
-# 目前还没有任何模型，Task 3 起逐行追加。
+from app.modules.departments.models import Department  # noqa: F401
