@@ -101,6 +101,8 @@ PostgreSQL 16，字符集 UTF-8。所有表带 `created_at`、`updated_at`（UTC
 | scale | varchar(32) | 规模 |
 | level | varchar(4) | `A` / `B` / `C`，默认 `C` |
 | source | varchar(64) | 来源渠道 |
+| procurement_type | varchar(16) | 采购方式：`tender` 招标 / `direct` 直采 / `framework` 框架协议 / `other` 其他，可空 |
+| budget_status | varchar(16) not null default 'unknown' | 预算状态：`approved` 已立项 / `pending` 预算未批 / `none` 无预算 / `unknown` 未知 |
 | status | varchar(16) not null default 'active' | `active` / `lost` / `inactive` |
 | owner_id | bigint FK users null | **空即为公海** |
 | department_id | bigint FK departments null | 冗余字段，随 owner 同步 |
@@ -147,6 +149,7 @@ PostgreSQL 16，字符集 UTF-8。所有表带 `created_at`、`updated_at`（UTC
 | stage | varchar(16) not null | 见 3.6 阶段枚举 |
 | amount | numeric(14,2) default 0 | 预计金额 |
 | expected_close_date | date | 预计成交日期 |
+| competitor | varchar(200) | 主要竞争对手（自由文本，多个用顿号分隔） |
 | owner_id | bigint FK users not null | |
 | win_rate | smallint | 赢单率百分比，默认由阶段推导 |
 | lost_reason_id | bigint FK lost_reasons null | 输单时必填 |
@@ -370,6 +373,7 @@ AND 满足 4.1 的另外两条豁免条件
 |---|---|
 | 日期 | 接受 `YYYY-MM-DD`、`YYYY/MM/DD`、Excel 序列号；`YYYY.MM.DD` 也接受 |
 | 阶段 | 中文名映射到枚举（如“方案报价”→`proposal`），无法映射报错 |
+| 采购方式 / 预算状态 | 中文映射到枚举（“招标”→`tender`、“已立项”→`approved`）；留空时预算状态取 `unknown` |
 | 金额 | 去千分位、去“元”“¥”“CNY”、去空格 |
 | 负责人 | 按 `users.username` 匹配；匹配不到报错，不静默置空 |
 | 客户（联系人/机会导入时） | 按 `customers.name` 精确匹配；匹配不到报错 |
@@ -384,6 +388,7 @@ AND 满足 4.1 的另外两条豁免条件
 - 前缀 `/api/v1`，REST，资源名复数。
 - 成功直接返回资源或分页体；错误统一 `{code, message, detail}`。
 - 分页：`?page=1&page_size=20`，响应 `{items, total, page, page_size}`。`page_size` 上限 200。
+- 列表筛选通用参数：`keyword`（名称/联系人/电话模糊匹配）、`owner_id`、`status`、`procurement_type`、`budget_status`、`stage`、`level`、日期区间 `date_from` / `date_to`、`sort`（白名单字段 + `-` 前缀表倒序）。
 - 认证：access token 存前端内存（2 小时），refresh token 用 `httpOnly` + `Secure` + `SameSite=Lax` cookie（7 天）。不使用 localStorage 存 token。页面刷新或 access token 过期时，前端用 refresh cookie 静默换取新 access token；refresh 失败则跳登录页。
 - 时区：数据库与接口一律 UTC（ISO 8601 带偏移），前端按 `Asia/Shanghai` 展示，“今天”的判断在后端统一用该时区。
 - 越权返回 403 而非 404（内部系统，明确告诉用户没权限比假装不存在更利于排障）。
@@ -455,6 +460,7 @@ GET    /admin/users  /admin/pool-rules  /admin/lost-reasons
 | 销售业绩 | 期间内赢单金额合计，按 `owner_id` 与月份分组 |
 | 跟进量 | 期间内 activities 条数，按 `created_by` 分组，按天/周聚合 |
 | 输单原因 | 按 `lost_reason_id` 分组，输出条数与金额合计 |
+| 竞争对手 | 按 `opportunities.competitor` 文本分组，输出机会数、金额合计与其中赢单率。同一机会填了多个对手时按顿号拆分后分别计入，故合计会大于机会总数 |
 
 默认统计区间为本月，可切换本月/上月/本季/本年/自定义。
 
