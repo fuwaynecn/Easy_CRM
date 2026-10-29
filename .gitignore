@@ -26,3 +26,12 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地临时目录（pip/npm 缓存、安装中间产物）
+.tmp/
+
+# SDD 执行账本（本地过程记录，不入库）
+.superpowers/
+
+# 沙箱下 pytest 产生的不可删空目录
+pytest-cache-files-*/
