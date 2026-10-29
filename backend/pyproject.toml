@@ -9,6 +9,8 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "alembic>=1.14",
     "pydantic>=2.9",
+    # pydantic 的 EmailStr 需要它：联系人的 email 填了就必须格式合法（design §3.4）
+    "email-validator>=2.0",
     "pydantic-settings>=2.6",
     "pyjwt>=2.9",
     "pwdlib[argon2]>=0.2",
