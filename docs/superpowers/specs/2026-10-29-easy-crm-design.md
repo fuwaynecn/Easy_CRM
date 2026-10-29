@@ -1,4 +1,4 @@
-# CY_CRM 设计说明
+# Easy CRM 设计说明
 
 > 状态：待审阅
 > 日期：2026-10-29
@@ -461,7 +461,7 @@ GET    /admin/users  /admin/pool-rules  /admin/lost-reasons
 ## 8. 目录结构
 
 ```
-CY_CRM/
+CY_CRM/                    # 本地工作目录；远程仓库为 fuwaynecn/Easy_CRM
 ├── backend/
 │   ├── app/
 │   │   ├── main.py
