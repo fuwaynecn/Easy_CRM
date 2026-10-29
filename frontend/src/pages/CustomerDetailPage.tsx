@@ -6,10 +6,12 @@ import { ApiError, errorMessage } from "../api/client";
 import { createContact, deleteContact, listContacts, updateContact } from "../api/contacts";
 import type { ContactBody } from "../api/contacts";
 import { getCustomer, updateCustomer } from "../api/customers";
+import { listOpportunities } from "../api/opportunities";
 import type { Contact, Customer } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
 import { Field, TextArea } from "../components/Field";
 import { Modal } from "../components/Modal";
+import { OpportunityFormModal } from "../components/OpportunityFormModal";
 import { QueryError } from "../components/QueryError";
 import {
   BUDGET_STATUS_LABELS,
@@ -18,6 +20,12 @@ import {
   PROCUREMENT_TYPE_LABELS,
   labelOf,
 } from "../constants/customerLabels";
+import {
+  STAGE_BADGE_CLASS,
+  STAGE_LABELS,
+  formatAmount,
+  formatDateOnly,
+} from "../constants/opportunityLabels";
 
 /**
  * 与后端 `EmailStr` 的底线一致（域名必须有点）。前端先拦一次，只为少一次
@@ -136,6 +144,7 @@ export default function CustomerDetailPage() {
   const [contactFieldErrors, setContactFieldErrors] = useState<FieldErrors>({});
   const [deleteTarget, setDeleteTarget] = useState<Contact | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [showOpportunityForm, setShowOpportunityForm] = useState(false);
 
   const customerQuery = useQuery({
     queryKey: ["customer", customerId],
@@ -147,6 +156,15 @@ export default function CustomerDetailPage() {
     queryKey: ["contacts", customerId],
     queryFn: () => listContacts(customerId),
     // 客户本身都没读到（403/404）时不再打一次必定失败的联系人请求。
+    enabled: validId && customerQuery.isSuccess,
+  });
+
+  // 机会列表的可见性继承客户：客户读不到（403/404）时这个查询也不发。
+  // 查询键 `["opportunities", "customer", id]` 落在 `["opportunities"]` 前缀下，
+  // OpportunityFormModal 新建成功后失效前缀即可让本页自动刷新。
+  const opportunitiesQuery = useQuery({
+    queryKey: ["opportunities", "customer", customerId],
+    queryFn: () => listOpportunities({ customer_id: customerId, page_size: 50 }),
     enabled: validId && customerQuery.isSuccess,
   });
 
@@ -554,6 +572,73 @@ export default function CustomerDetailPage() {
         </section>
       </div>
 
+      {/* 机会区放在两栏之外、整行铺满：机会是"这个客户在谈什么"的主线，塞进
+          380px 右栏会挤成三列字。可见性继承客户：看不到客户就看不到这里。
+          这里只读列表 + 新建入口；改阶段/拖拽属于看板（本页不做第二套交互）。 */}
+      <section className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-slate-900">销售机会</h2>
+          <div className="flex items-center gap-2">
+            <Link to="/opportunities/board" className="text-sm text-brand-600 hover:underline">
+              看板
+            </Link>
+            {writable ? (
+              <button
+                type="button"
+                onClick={() => setShowOpportunityForm(true)}
+                className="rounded-md border border-slate-300 px-2.5 py-1 text-sm hover:bg-slate-100"
+              >
+                + 新建机会
+              </button>
+            ) : (
+              <span className="text-xs text-slate-500">只读</span>
+            )}
+          </div>
+        </div>
+
+        {opportunitiesQuery.isError ? (
+          <p className="break-words text-sm text-red-600">
+            {errorMessage(opportunitiesQuery.error, "机会加载失败")}
+          </p>
+        ) : opportunitiesQuery.isPending ? (
+          <p className="text-sm text-slate-500">加载中…</p>
+        ) : (opportunitiesQuery.data?.items.length ?? 0) === 0 ? (
+          <p className="text-sm text-slate-500">
+            还没有机会。{writable ? "点右上角「+ 新建机会」开始记录。" : ""}
+          </p>
+        ) : (
+          <ul className="divide-y divide-slate-100">
+            {(opportunitiesQuery.data?.items ?? []).map((item) => (
+              <li
+                key={item.id}
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-sm"
+              >
+                <span className="min-w-0 break-words font-medium text-slate-900">
+                  {item.name}
+                </span>
+                <span
+                  className={`inline-flex shrink-0 rounded px-1.5 py-0.5 text-xs font-medium ${
+                    STAGE_BADGE_CLASS[item.stage] ?? "bg-slate-100 text-slate-700"
+                  }`}
+                >
+                  {STAGE_LABELS[item.stage] ?? item.stage}
+                </span>
+                <span className="shrink-0 text-slate-600">{formatAmount(item.amount)}</span>
+                <span className="break-words text-xs text-slate-500">
+                  预计成交 {formatDateOnly(item.expected_close_date)} · 赢单率 {item.win_rate}% ·
+                  负责人 {item.owner_name}
+                </span>
+                {item.lost_reason_name ? (
+                  <span className="break-words text-xs text-slate-500">
+                    输单原因：{item.lost_reason_name}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       {contactModal !== null ? (
         <Modal
           title={contactModal.mode === "create" ? "添加联系人" : "编辑联系人"}
@@ -657,6 +742,14 @@ export default function CustomerDetailPage() {
             </div>
           </div>
         </Modal>
+      ) : null}
+
+      {showOpportunityForm ? (
+        <OpportunityFormModal
+          mode="create"
+          fixedCustomer={{ id: customer.id, name: customer.name }}
+          onClose={() => setShowOpportunityForm(false)}
+        />
       ) : null}
 
       {deleteTarget !== null ? (

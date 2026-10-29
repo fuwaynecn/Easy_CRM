@@ -1,6 +1,6 @@
-"""跨角色的 P1 端到端冒烟（HTTP 级）。
+"""跨角色的端到端冒烟（HTTP 级）：P1 客户/权限 + P2 机会生命周期。
 
-一个测试文件覆盖 P1 最容易坏的路径，全部走真实 HTTP 与真实数据库，不打桩：
+一个测试文件覆盖最容易坏的路径，全部走真实 HTTP 与真实数据库，不打桩：
 
 1. 销售建客户 → 加两个联系人 → 改第二个 → 设为主联系人 → 原主的标记被清掉；
 2. 销售读同部门同事的客户是 403（不是空列表、不是 404）；
@@ -8,7 +8,9 @@
 4. 主管看得到本部门全部 + 公海，看不到别部门客户详情（403），能改本部门客户；
 5. 管理员能读任何人名下的客户，``owner_name`` 是真实姓名而不是「用户 #N」；
 6. 重名先 409（``detail.similar`` 为 ``[{id, name}]``）→ ``force=true`` 成功 →
-   紧接着再建同名仍 409（force 只对当次生效）。
+   紧接着再建同名仍 409（force 只对当次生效）；
+7. （P2）机会从 contact 一路推到 won → 主管重开 → 标 lost，接口派生值、库里的
+   终态字段、``stage_histories`` 的 from/to 序列三处必须互相对齐。
 
 与 brief 样例的差异（样例写于早期，按现状改写）：联系人改/删走扁平
 ``PATCH|DELETE /api/v1/contacts/{id}``（嵌套写路由已删除）；``create_user`` 要求
@@ -25,8 +27,12 @@ from sqlalchemy import select
 from app.modules.contacts.models import Contact
 from app.modules.customers.models import Customer
 from app.modules.departments.service import create_department
+from app.modules.lost_reasons.schemas import LostReasonCreate
+from app.modules.lost_reasons.service import create_lost_reason
+from app.modules.opportunities.models import Opportunity, StageHistory
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
+from scripts.seed import LOST_REASONS
 
 PASSWORD = "Passw0rd!"
 
@@ -348,3 +354,161 @@ def test_every_seed_style_account_can_login(client, db, username):
     """所有角色的账号都能登录：夹具的部门必修课没有把某类账号挤掉。"""
     _setup(db)
     assert _auth(client, username)
+
+
+def test_opportunity_lifecycle_end_to_end(client, db):
+    """P2 冒烟：建客户 → 建机会 → 推进 → 赢单 → 主管重开 → 输单，全程真实 HTTP。
+
+    与 `test_opportunities_api.py` 的分工：那边逐条钉单点规则（422/403/400），这里只
+    走"一条机会从生到死"的完整路径，并在**同一个测试里**对齐三件容易互相矛盾的东西：
+    接口返回的派生值（`win_rate` 跟随阶段）、库里的终态字段、`stage_histories` 的
+    from/to 序列。history 是漏斗报表的唯一数据来源，序列错一位报表就会把"重开"算成
+    两次赢单。
+
+    重开与输单都用主管账号：重开限 `manager`/`admin`（销售试一次必须 403，这一条也
+    钉在这里）。输单原因取 `scripts.seed.LOST_REASONS` 的第一条，避免测试里另造一套
+    字典口径——种子改名而测试没跟，`KeyError`/404 会立刻暴露。
+    """
+    people = _setup(db)
+    sales = _auth(client, "sales1")
+    customer = _create_customer(client, sales, "端到端制造有限公司")
+    # 种子口径的输单原因（P2 只有只读接口，测试里用服务层建一条同名记录）
+    reason = create_lost_reason(db, LostReasonCreate(name=LOST_REASONS[0]))
+
+    created = client.post(
+        "/api/v1/opportunities",
+        headers=sales,
+        json={
+            "customer_id": customer["id"],
+            "name": "端到端机会",
+            "amount": "123456.78",
+            "expected_close_date": "2026-12-31",
+        },
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["stage"] == "contact"
+    assert body["amount"] == "123456.78"
+    assert body["owner_name"] == "张明"          # 继承客户负责人
+    assert body["customer_name"] == "端到端制造有限公司"
+    assert body["win_rate"] == 10                 # 跟随阶段默认值
+    opportunity_id = body["id"]
+
+    # 阶段只能经 /stage：PATCH 带 stage 在 schema 层就 422，`stage_histories` 写不全
+    # 这件事在 HTTP 层就不可能发生。
+    bypass = client.patch(
+        f"/api/v1/opportunities/{opportunity_id}",
+        headers=sales,
+        json={"stage": "needs"},
+    )
+    assert bypass.status_code == 422, bypass.text
+    assert bypass.json()["code"] == "validation_error"
+
+    for stage in ("needs", "proposal"):
+        resp = client.post(
+            f"/api/v1/opportunities/{opportunity_id}/stage",
+            headers=sales,
+            json={"stage": stage},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["stage"] == stage
+
+    won = client.post(
+        f"/api/v1/opportunities/{opportunity_id}/stage",
+        headers=sales,
+        json={"stage": "won"},
+    )
+    assert won.status_code == 200, won.text
+    assert won.json()["won_at"] is not None
+    assert won.json()["win_rate"] == 100
+    assert won.json()["lost_reason_id"] is None
+
+    # 销售不能重开自己赢的单，且 403 不能让状态变化
+    denied = client.post(
+        f"/api/v1/opportunities/{opportunity_id}/stage",
+        headers=sales,
+        json={"stage": "negotiation", "note": "我自己重开"},
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["code"] == "forbidden"
+    assert denied.json()["message"] == "仅主管及以上可重开已关闭的机会"
+
+    boss = _auth(client, "boss")
+    # 重开原因必填：缺了是 400（不是悄悄写一条 note 为空的历史）
+    missing_note = client.post(
+        f"/api/v1/opportunities/{opportunity_id}/stage",
+        headers=boss,
+        json={"stage": "negotiation"},
+    )
+    assert missing_note.status_code == 400, missing_note.text
+    assert missing_note.json()["code"] == "invalid_value"
+    assert missing_note.json()["message"] == "重开机会必须填写重开原因"
+
+    reopen_note = "客户追加预算，重新评估技术方案"
+    reopened = client.post(
+        f"/api/v1/opportunities/{opportunity_id}/stage",
+        headers=boss,
+        json={"stage": "negotiation", "note": reopen_note},
+    )
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["stage"] == "negotiation"
+    assert reopened.json()["won_at"] is None       # 重开必须清掉赢单时间
+    assert reopened.json()["lost_reason_id"] is None
+    assert reopened.json()["win_rate"] == 70       # 回到自动值（跟随后阶段）
+
+    lost = client.post(
+        f"/api/v1/opportunities/{opportunity_id}/stage",
+        headers=boss,
+        json={
+            "stage": "lost",
+            "lost_reason_id": reason.id,
+            "lost_note": "客户把预算挪到明年",
+        },
+    )
+    assert lost.status_code == 200, lost.text
+    assert lost.json()["stage"] == "lost"
+    assert lost.json()["won_at"] is None
+    assert lost.json()["lost_reason_id"] == reason.id
+    assert lost.json()["lost_reason_name"] == LOST_REASONS[0]
+    assert lost.json()["win_rate"] == 0
+
+    # 看板口径与单条记录一致：赢单列空、输单列一条且金额是变更当刻的值
+    board = client.get("/api/v1/opportunities/board", headers=boss)
+    assert board.status_code == 200, board.text
+    columns = {column["stage"]: column for column in board.json()["columns"]}
+    assert columns["won"]["total"] == 0
+    assert columns["lost"]["total"] == 1
+    assert columns["lost"]["amount_total"] == "123456.78"
+    assert columns["lost"]["items"][0]["id"] == opportunity_id
+    assert columns["contact"]["total"] == 0
+
+    db.expire_all()
+    history = list(
+        db.execute(
+            select(StageHistory)
+            .where(StageHistory.opportunity_id == opportunity_id)
+            .order_by(StageHistory.id)
+        )
+        .scalars()
+        .all()
+    )
+    assert [(row.from_stage, row.to_stage) for row in history] == [
+        (None, "contact"),
+        ("contact", "needs"),
+        ("needs", "proposal"),
+        ("proposal", "won"),
+        ("won", "negotiation"),
+        ("negotiation", "lost"),
+    ]
+    # 重开原因落在**重开那一行**上；终态转换与创建都不带 note
+    assert [row.note for row in history] == [None, None, None, None, reopen_note, None]
+    assert history[4].operator_id == people["boss"].id
+    # 金额快照记的是变更当刻的值，不是 join 回 opportunities 的现值
+    assert {str(row.amount_snapshot) for row in history} == {"123456.78"}
+
+    opportunity = db.get(Opportunity, opportunity_id)
+    assert opportunity is not None
+    assert opportunity.stage == "lost"
+    assert opportunity.won_at is None
+    assert opportunity.lost_reason_id == reason.id
+    assert opportunity.lost_note == "客户把预算挪到明年"
