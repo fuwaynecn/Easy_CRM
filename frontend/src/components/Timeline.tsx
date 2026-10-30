@@ -15,6 +15,12 @@ import { Modal } from "./Modal";
 
 interface Props {
   customerId: number;
+  /**
+   * 客户当前是否可写（公海只读，或 admin 例外）。**必须**参与行内按钮判定：
+   * `mine` 只说明"这条是我写的"，不说明"我现在还能改"——公海客户的历史跟进
+   * 对非 admin 是只读的，露出按钮等于把用户领进必定 403 的操作。
+   */
+  writable: boolean;
   /** 编辑由父组件开 ActivityFormModal（时间线不拥有写表单） */
   onEdit: (draft: ActivityDraft) => void;
 }
@@ -30,7 +36,7 @@ interface Props {
  * - 金额用 `amount_snapshot`（阶段变更当刻的定点字符串），**不读**机会现值。
  * - 游标原样回传，前端不解析（裁定 14）。
  */
-export function Timeline({ customerId, onEdit }: Props) {
+export function Timeline({ customerId, writable, onEdit }: Props) {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const [deleteTarget, setDeleteTarget] = useState<number | null>(null);
@@ -89,10 +95,12 @@ export function Timeline({ customerId, onEdit }: Props) {
     <div className="space-y-3">
       <ol className="space-y-3">
         {items.map((item) => {
-          // 时间线只给"本人或管理员"开编辑/删除入口：主管可删本部门的规则需要
-          // 部门归属，前端不猜；后端仍会按裁定 5 放行/拒绝。
+          // 行内按钮要同时满足三条：客户此刻可写（公海客户对非 admin 只读）、这条是
+          // 跟进（阶段变更不可编辑）、且是我写的或是管理员。
+          // 主管删本部门记录的规则需要部门归属，前端不猜；后端仍按裁定 5 放行/拒绝。
           const mine = item.operator_id !== null && item.operator_id === user?.id;
-          const canTouch = item.type === "activity" && (mine || user?.role === "admin");
+          const canTouch =
+            writable && item.type === "activity" && (mine || user?.role === "admin");
           return (
             <li key={`${item.type}-${item.id}`} className="flex gap-3">
               <span className="mt-1 h-fit shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">

@@ -188,10 +188,11 @@ export default function CustomerDetailPage() {
   // 5 条"，全量在首页按天汇总——详情页不是待办管理台。
   // key 落在 `["follow_ups"]` 前缀下：写跟进/新建待办/完成待办都按这个前缀失效，
   // 这张卡因此不需要各自再通知一遍。
+  // enabled 与联系人/机会同一条线：客户读不到（403/404）时不再打一次注定失败的请求。
   const followUpsQuery = useQuery({
     queryKey: ["follow_ups", customerId, "pending"],
     queryFn: () => listFollowUps({ customer_id: customerId, status: "pending", page_size: 5 }),
-    enabled: validId,
+    enabled: validId && customerQuery.isSuccess,
   });
 
   const [showActivityForm, setShowActivityForm] = useState(false);
@@ -717,7 +718,7 @@ export default function CustomerDetailPage() {
 
           {(followUpsQuery.data?.total ?? 0) > (followUpsQuery.data?.items.length ?? 0) ? (
             <p className="text-xs text-slate-400">
-              共 {followUpsQuery.data?.total} 条未完成，这里只显示最近 5 条。
+              共 {followUpsQuery.data?.total} 条未完成，这里显示最早到期的 5 条。
             </p>
           ) : null}
 
@@ -812,9 +813,11 @@ export default function CustomerDetailPage() {
             <span className="shrink-0 text-xs text-slate-500">只读</span>
           )}
         </div>
-        {/* 时间线自带加载更多与空态；客户不可见时这里根本不会渲染（上方已 return） */}
+        {/* 时间线自带加载更多与空态；客户不可见时这里根本不会渲染（上方已 return）。
+            writable 必须传进去：公海客户的历史跟进对非 admin 只读，行内按钮要收口。 */}
         <Timeline
           customerId={customerId}
+          writable={writable}
           onEdit={(draft) => {
             setActivityDraft(draft);
             setShowActivityForm(true);
