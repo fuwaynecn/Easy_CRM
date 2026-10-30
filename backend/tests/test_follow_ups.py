@@ -406,6 +406,44 @@ def test_completed_follow_up_cannot_change_status(db):
         update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(status="pending"))
 
 
+def test_completed_follow_up_cannot_change_content_or_due_at(db):
+    """终态无条件冻结：不带 status 的 PATCH 也不能改写已完成的待办。
+
+    原先的判断被嵌在 ``if "status" in changes:`` 里，只改 content/due_at 能绕过。
+    """
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"], content="原内容")
+    complete_follow_up(db, f["sa"], todo.id, FollowUpDone())
+
+    with pytest.raises(InvalidValueError):
+        update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(content="改内容"))
+    with pytest.raises(InvalidValueError):
+        update_follow_up(
+            db, f["sa"], todo.id, FollowUpUpdate(due_at=NOW + timedelta(days=9))
+        )
+
+    db.expire_all()
+    row = db.get(FollowUp, todo.id)
+    assert row.content == "原内容"
+    assert row.due_at == NOW
+
+
+def test_cancelled_follow_up_cannot_change_content_but_can_reopen(db):
+    """取消是"不做了"的留痕态：内容/时间冻结，但允许重开为待办。"""
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"], content="下周回访")
+    update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(status="cancelled"))
+
+    with pytest.raises(InvalidValueError):
+        update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(content="改成别的"))
+
+    db.expire_all()
+    assert db.get(FollowUp, todo.id).content == "下周回访"
+
+    reopened = update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(status="pending"))
+    assert reopened.status == "pending"
+
+
 def test_complete_sets_status_and_done_at(db):
     f = _setup(db)
     todo = _insert(db, f["sa"], f["cust_a"])
@@ -500,11 +538,48 @@ def test_manager_can_delete_department_todo_but_not_edit(db):
     assert db.get(FollowUp, todo.id).deleted_at is not None
 
 
+def test_manager_cannot_complete_subordinate_todo(db):
+    """裁定 5：主管对下属的待办只能删，不能替人完成——否则等于绕过编辑权限。"""
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(ForbiddenError):
+        complete_follow_up(db, f["boss"], todo.id, FollowUpDone())
+
+    db.expire_all()
+    row = db.get(FollowUp, todo.id)
+    assert row.status == "pending"
+    assert row.done_at is None
+
+
+def test_creator_can_edit_todo_on_others_customer(db):
+    """「创建者」分支：主管在别人客户上建的待办，自己仍然能改。
+
+    与 ``test_manager_can_delete_department_todo_but_not_edit`` 一起钉住权限矩阵：
+    改别人建的 → 403，改自己建的 → OK。
+    """
+    f = _setup(db)
+    todo = _insert(db, f["boss"], f["cust_a"], content="主管安排的回访")
+
+    updated = update_follow_up(
+        db, f["boss"], todo.id, FollowUpUpdate(content="主管自己改")
+    )
+
+    assert updated.content == "主管自己改"
+
+
 def test_delete_follow_up_is_soft_and_repeat_is_404(db):
     f = _setup(db)
     todo = _insert(db, f["sa"], f["cust_a"])
 
     delete_follow_up(db, f["sa"], todo.id)
+
+    db.expire_all()
+    row = db.get(FollowUp, todo.id)
+    assert row is not None and row.deleted_at is not None
+    # 软删不是 DELETE：物理行数不变，重复删除走 404（get_follow_up 的软删过滤）
+    assert db.execute(select(func.count()).select_from(FollowUp)).scalar_one() == 1
+
     with pytest.raises(NotFoundError):
         delete_follow_up(db, f["sa"], todo.id)
 

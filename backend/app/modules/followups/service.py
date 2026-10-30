@@ -229,15 +229,24 @@ def update_follow_up(
 ) -> FollowUp:
     """编辑待办：改内容/到期时间，或在 pending ↔ cancelled 之间切换。
 
-    所有校验都在 ``setattr`` 之前完成：``status="done"`` 或任何非法迁移直接 400，
-    不会出现"改了一半再抛"的半写状态。
+    所有校验都在 ``setattr`` 之前完成，不会出现"改了一半再抛"的半写状态：
+    - ``done`` 是终态：任何 PATCH 都 400（完成/取消/改期都必须先想清楚）；
+    - ``cancelled`` 只冻结内容与时间，``status → pending`` 仍可重开；
+    - ``status="done"`` 永远走不通（完成只能走 ``complete_follow_up``，裁定 10）。
     """
     follow_up = get_follow_up(db, actor, follow_up_id)
     customer = get_customer(db, actor, follow_up.customer_id)
     assert_customer_writable(customer, actor)
     _assert_can_edit_follow_up(follow_up, actor, customer)
 
+    # 终态无条件冻结：不能只在"这次 PATCH 带了 status"时才挡——否则改 content /
+    # due_at 会绕过终态，等于完成后的待办还能被悄悄改写。
+    if follow_up.status == "done":
+        raise InvalidValueError("已完成的待办不能再修改")
+
     changes = payload.model_dump(exclude_unset=True)
+    if follow_up.status == "cancelled" and ({"content", "due_at"} & changes.keys()):
+        raise InvalidValueError("已取消的待办不能修改内容或时间，请先恢复为待办")
     if "status" in changes:
         status = changes["status"]
         if status is None:
@@ -246,8 +255,6 @@ def update_follow_up(
             raise InvalidValueError("标记完成请使用 POST /follow_ups/{id}/done")
         if status not in ("pending", "cancelled"):
             raise InvalidValueError(f"未知待办状态：{status}")
-        if follow_up.status == "done":
-            raise InvalidValueError("已完成的待办不能再改状态")
     if "due_at" in changes and changes["due_at"] is None:
         raise InvalidValueError("到期时间不能为空")
     if "due_at" in changes:
@@ -268,10 +275,15 @@ def complete_follow_up(
     三件事一起成/一起不成：待办置 done、可选的跟进记录、``last_activity_at``。
     校验全部在写入之前：已完成的不能再完成、已取消的不能完成、不勾选却指定跟进
     方式一律 400。
+
+    权限比"能写客户"更紧一档：完成会改变待办归属状态的最终结论，按裁定 5 只有
+    创建者、客户当前负责人与管理员能做；主管对下属的待办**只能删**（明明写不了
+    内容却能替人"完成"，等于绕过编辑权限）。
     """
     follow_up = get_follow_up(db, actor, follow_up_id)
     customer = get_customer(db, actor, follow_up.customer_id)
     assert_customer_writable(customer, actor)
+    _assert_can_edit_follow_up(follow_up, actor, customer)
 
     if follow_up.status == "done":
         raise InvalidValueError("该待办已完成")
@@ -294,7 +306,8 @@ def complete_follow_up(
             contact_id=follow_up.contact_id,
             opportunity_id=follow_up.opportunity_id,
             type=payload.activity_type,
-            content=follow_up.content,
+            # 纵深防御：API 写不进空白内容，但历史数据/运维改库可以；复制前再清洗一次
+            content=_clean_content(follow_up.content),
             activity_at=now,
             operator_id=actor.id,
         )
