@@ -159,6 +159,15 @@ class StageHistory(Base, TimestampMixin):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # 时间线要显示"谁改的""哪个机会"：两个关系一律 lazy="raise"，读取入口统一
+    # joinedload（与 Opportunity 的三个关系同口径），漏预加载会立刻报错。
+    # operator 允许为空（系统/迁移写入），且**不**在 join 上过滤停用账号——停用的
+    # 操作人姓名仍要出现在历史里，前端按 operator_disabled 打标。
+    operator: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[operator_id], lazy="raise"
+    )
+    opportunity: Mapped["Opportunity"] = relationship("Opportunity", lazy="raise")
+
     __table_args__ = (
         Index(
             "ix_stage_histories_opportunity_id_changed_at",
