@@ -538,6 +538,32 @@ def test_manager_can_delete_department_todo_but_not_edit(db):
     assert db.get(FollowUp, todo.id).deleted_at is not None
 
 
+def test_complete_with_blank_content_after_bypass_is_400(db):
+    """历史数据/运维改库可能留下全空白 content；完成时必须先清洗再落状态。
+
+    API 写不进空白内容，所以这条守卫只能用"直接改 ORM 行"来触发；断言的重点是
+    异常发生在 ``status='done'`` **之前**：待办仍是 pending、没有写出任何跟进。
+    """
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"], content="原本有内容")
+    todo.content = "   "
+    db.commit()
+
+    with pytest.raises(InvalidValueError):
+        complete_follow_up(
+            db,
+            f["sa"],
+            todo.id,
+            FollowUpDone(create_activity=True, activity_type="visit"),
+        )
+
+    db.expire_all()
+    row = db.get(FollowUp, todo.id)
+    assert row.status == "pending"
+    assert row.done_at is None
+    assert db.execute(select(func.count()).select_from(Activity)).scalar_one() == 0
+
+
 def test_manager_cannot_complete_subordinate_todo(db):
     """裁定 5：主管对下属的待办只能删，不能替人完成——否则等于绕过编辑权限。"""
     f = _setup(db)

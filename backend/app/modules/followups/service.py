@@ -295,6 +295,9 @@ def complete_follow_up(
         validate_activity_type(payload.activity_type)
 
     now = datetime.now(UTC)
+    # 先清洗再落状态：清洗可能 400（历史数据/运维改库留下的空白内容），不能先把内存
+    # 里的行置成 done 再抛——虽然没 commit，但异常路径的会话状态不该带半截改动。
+    copied_content = _clean_content(follow_up.content)
     follow_up.status = "done"
     follow_up.done_at = now
 
@@ -306,8 +309,7 @@ def complete_follow_up(
             contact_id=follow_up.contact_id,
             opportunity_id=follow_up.opportunity_id,
             type=payload.activity_type,
-            # 纵深防御：API 写不进空白内容，但历史数据/运维改库可以；复制前再清洗一次
-            content=_clean_content(follow_up.content),
+            content=copied_content,
             activity_at=now,
             operator_id=actor.id,
         )
