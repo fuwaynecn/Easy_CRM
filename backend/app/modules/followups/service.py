@@ -6,6 +6,8 @@
 **不是**按 ``follow_ups.created_by``——后者会让接手人看不到前任留下的待办。
 """
 
+from datetime import datetime
+
 from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.orm import Session, joinedload
 
@@ -15,6 +17,44 @@ from app.modules.customers.models import Customer
 from app.modules.customers.service import get_customer
 from app.modules.followups.models import FOLLOW_UP_STATUSES, FollowUp
 from app.modules.users.models import User
+
+
+def _clean_content(content: str | None) -> str:
+    """strip 后不能为空：全空格能通过 schema 的 ``min_length=1``，却是一行看不见的空白。"""
+    cleaned = (content or "").strip()
+    if not cleaned:
+        raise InvalidValueError("待办内容不能为空")
+    return cleaned
+
+
+def create_pending_follow_up_in_tx(
+    db: Session,
+    *,
+    customer_id: int,
+    contact_id: int | None,
+    opportunity_id: int | None,
+    due_at: datetime,
+    content: str,
+    created_by: int,
+) -> FollowUp:
+    """插一条 pending 待办，**不 commit**。
+
+    两个调用方：``POST /follow_ups``（Task 5）与「写跟进时填了下次跟进」
+    （activities.create_activity）。后者是跨模块调用，因此这里不校验权限、不 commit
+    ——权限与事务由调用方负责，重复校验会让"谁能写待办"出现两个口径。
+    """
+    follow_up = FollowUp(
+        customer_id=customer_id,
+        contact_id=contact_id,
+        opportunity_id=opportunity_id,
+        due_at=due_at,
+        content=_clean_content(content),
+        status="pending",
+        created_by=created_by,
+    )
+    db.add(follow_up)
+    db.flush()  # 拿到自增 id，调用方要在同一响应里返回它
+    return follow_up
 
 
 def _visible_conditions(

@@ -20,7 +20,7 @@ import re
 import unicodedata
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import Select, func, or_, select, update
+from sqlalchemy import DateTime, Select, func, literal, or_, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.errors import (
@@ -446,3 +446,28 @@ def sync_customer_department(
         .values(department_id=department_id)
     )
     return int(result.rowcount or 0)
+
+
+def mark_customer_activity(
+    db: Session, *, customer_id: int, occurred_at: datetime
+) -> None:
+    """把客户的「最后有效跟进时间」推进到 ``occurred_at``（不 commit）。
+
+    design §3.3 的三个同步点只有「新建 activity」「领取」「转移」；P4 之前只有第一个
+    有调用方。**用 ``GREATEST`` 而不是直接赋值**：补录历史跟进时不能把时间倒回去，
+    否则一个 40 天没跟进的客户会因为补录了一条半年前的记录而"变新鲜"，回收任务永远
+    收不到它。
+
+    本函数不 commit：调用方（写跟进、完成待办顺带写跟进）必须与业务行落在同一个
+    事务里，否则会出现"跟进已入库、客户仍被视为僵尸"的中间态。
+    """
+    value = literal(occurred_at, type_=DateTime(timezone=True))
+    db.execute(
+        update(Customer)
+        .where(Customer.id == customer_id)
+        .values(
+            last_activity_at=func.greatest(
+                func.coalesce(Customer.last_activity_at, value), value
+            )
+        )
+    )

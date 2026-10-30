@@ -7,13 +7,25 @@
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
 from app.modules.activities.models import ACTIVITY_TYPES, Activity
-from app.modules.activities.service import get_activity, list_activities
+from app.modules.activities.schemas import ActivityCreate, ActivityUpdate
+from app.modules.activities.service import (
+    create_activity,
+    delete_activity,
+    get_activity,
+    list_activities,
+    update_activity,
+)
+from app.modules.contacts.schemas import ContactCreate
+from app.modules.contacts.service import create_contact
+from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
+from app.modules.followups.models import FollowUp
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
 
@@ -67,23 +79,23 @@ def test_activity_table_is_registered_in_metadata():
     assert columns["opportunity_id"].nullable is True
 
 
-def _insert(db, actor, customer, *, content="电话沟通", type="call", activity_at=None):
-    """读侧测试的最小造数：直接插表，不依赖尚不存在的写接口（写接口在 Task 4）。
+def _insert(db, actor, customer, *, content="电话沟通", type="call", activity_at=None, **overrides):
+    """测试造数统一走真实写接口；`_insert` 只是新旧测试之间的兼容层。
 
-    这是"设置既有列"的同类做法，不是伪造业务动作——Task 4 会把本 helper 全体替换成
-    ``create_activity`` 调用，届时删掉它。
+    走真实写入而不是直接插表：待办联动、``last_activity_at``、内容清洗、权限都在
+    ``create_activity`` 里，直接插表会让读侧测试在一个生产路径到不了的状态上做断言。
     """
-    row = Activity(
-        customer_id=customer.id,
-        type=type,
-        content=content,
-        activity_at=activity_at or NOW,
-        created_by=actor.id,
+    return create_activity(
+        db,
+        actor,
+        ActivityCreate(
+            customer_id=customer.id,
+            content=content,
+            type=type,
+            activity_at=activity_at or NOW,
+            **overrides,
+        ),
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
 
 
 def test_activity_type_tuple_matches_spec():
@@ -130,7 +142,8 @@ def test_list_filters_by_customer_type_and_created_by(db):
     f = _setup(db)
     call = _insert(db, f["sa"], f["cust_a"], content="电话", type="call")
     _insert(db, f["sa"], f["cust_a"], content="拜访", type="visit")
-    other = _insert(db, f["sc"], f["cust_a"], content="同事的拜访", type="visit")
+    # 真实写路径下销售不能写同事的客户，能写他人客户的只有本部门主管（见 assert_customer_writable）
+    other = _insert(db, f["boss"], f["cust_a"], content="主管的拜访", type="visit")
 
     # 只看 total：本用例关心的是「按客户筛选确实命中 3 条」而不是返回内容
     _by_customer, total = list_activities(
@@ -142,7 +155,7 @@ def test_list_filters_by_customer_type_and_created_by(db):
     assert total == 1
     assert [item.id for item in by_type] == [call.id]
 
-    by_author, total = list_activities(db, f["boss"], created_by=f["sc"].id)
+    by_author, total = list_activities(db, f["boss"], created_by=f["boss"].id)
     assert total == 1
     assert [item.id for item in by_author] == [other.id]
 
@@ -233,9 +246,13 @@ def test_same_instant_orders_by_id_desc_and_pages_stably(db):
 
 
 def test_same_department_colleague_activity_is_visible(db):
-    """可见性随客户、不随作者：同部门同事在"我的客户"上写的跟进，我看得见。"""
+    """可见性随客户、不随作者：同部门主管在销售的客户上写的跟进，销售看得见。
+
+    作者取主管而不是同部门销售：真实写路径里 ``assert_customer_writable`` 只允许
+    本人/本部门主管/管理员写，销售写不了同事的客户（直接插表的旧造数掩盖了这条）。
+    """
     f = _setup(db)
-    colleague = _insert(db, f["sc"], f["cust_a"], content="同事替我打的电话")
+    colleague = _insert(db, f["boss"], f["cust_a"], content="主管替我打的电话")
 
     items, total = list_activities(db, f["sa"])
 
@@ -256,3 +273,194 @@ def test_empty_type_filter_means_no_filter(db):
 
     assert total == 1
     assert len(items) == 1
+
+
+def test_create_sets_last_activity_at(db):
+    f = _setup(db)
+    customer = db.get(Customer, f["cust_a"].id)
+    assert customer.last_activity_at is None
+
+    _insert(db, f["sa"], f["cust_a"], activity_at=NOW)
+
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at == NOW
+
+
+def test_backdated_activity_does_not_roll_back_last_activity_at(db):
+    """补录历史跟进取 max(原值, activity_at)（spec §3.3 第 1 条）。"""
+    f = _setup(db)
+    _insert(db, f["sa"], f["cust_a"], activity_at=NOW)
+
+    _insert(db, f["sa"], f["cust_a"], content="补录上周的拜访", activity_at=NOW - timedelta(days=7))
+
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at == NOW
+
+
+def test_backdated_only_activity_sets_past_time(db):
+    f = _setup(db)
+    _insert(db, f["sa"], f["cust_a"], activity_at=NOW - timedelta(days=3))
+
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at == NOW - timedelta(days=3)
+
+
+def test_create_activity_with_next_follow_up_creates_pending_todo(db):
+    """spec §4.5：填了"下次跟进"就在同一个事务里建一条 pending 待办。"""
+    f = _setup(db)
+    activity = create_activity(
+        db,
+        f["sa"],
+        ActivityCreate(
+            customer_id=f["cust_a"].id,
+            content="电话确认技术参数",
+            type="call",
+            activity_at=NOW,
+            next_follow_up={
+                "due_at": NOW + timedelta(days=3),
+                "content": "把样册送到现场",
+            },
+        ),
+    )
+
+    todos = list(
+        db.execute(
+            select(FollowUp).where(
+                FollowUp.customer_id == f["cust_a"].id, FollowUp.status == "pending"
+            )
+        ).scalars()
+    )
+    assert len(todos) == 1
+    assert todos[0].content == "把样册送到现场"
+    assert todos[0].due_at == NOW + timedelta(days=3)
+    # 待办本身不推进最后跟进时间（§3.3 只认 activity / 领取 / 转移）
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at == NOW
+    assert activity.id is not None
+
+
+def test_create_activity_on_pool_customer_is_403_for_sales(db):
+    f = _setup(db)
+    with pytest.raises(ForbiddenError) as exc:
+        create_activity(
+            db, f["sa"], ActivityCreate(customer_id=f["cust_pool"].id, content="打电话")
+        )
+    assert "公海" in str(exc.value)
+
+
+def test_create_activity_rejects_unknown_type(db):
+    f = _setup(db)
+    with pytest.raises(InvalidValueError):
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(customer_id=f["cust_a"].id, content="沟通", type="telepathy"),
+        )
+
+
+def test_create_activity_rejects_empty_type(db):
+    """写侧严格、筛选侧宽松的分界线（T3 补测留下的义务）。
+
+    ``list_activities(type="")`` 是"不筛选"，但 ``create_activity(type="")`` 是非法
+    取值：空串落库只会剩下数据库 CHECK 兜底，变成一个前端选不中、报表也认不出的类型。
+    """
+    f = _setup(db)
+    with pytest.raises(InvalidValueError):
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(customer_id=f["cust_a"].id, content="沟通", type=""),
+        )
+
+
+def test_create_activity_requires_content_after_strip(db):
+    f = _setup(db)
+    with pytest.raises(InvalidValueError):
+        create_activity(
+            db, f["sa"], ActivityCreate(customer_id=f["cust_a"].id, content="   ")
+        )
+
+
+def test_create_activity_rejects_contact_from_another_customer(db):
+    f = _setup(db)
+    foreign = create_contact(db, f["sb"], f["cust_b"].id, ContactCreate(name="外部联系人"))
+    with pytest.raises(InvalidValueError) as exc:
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(
+                customer_id=f["cust_a"].id, content="沟通", contact_id=foreign.id
+            ),
+        )
+    assert "联系人" in str(exc.value)
+
+
+def test_create_activity_rejects_missing_contact(db):
+    f = _setup(db)
+    with pytest.raises(NotFoundError):
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(customer_id=f["cust_a"].id, content="沟通", contact_id=999_999),
+        )
+
+
+def test_update_activity_never_touches_last_activity_at(db):
+    """裁定 8：编辑（含把时间改到现在）一律不推进 last_activity_at。"""
+    f = _setup(db)
+    activity = _insert(db, f["sa"], f["cust_a"], activity_at=NOW - timedelta(days=5))
+
+    update_activity(
+        db, f["sa"], activity.id, ActivityUpdate(activity_at=NOW, content="补正内容")
+    )
+
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at == NOW - timedelta(days=5)
+    assert db.get(Activity, activity.id).content == "补正内容"
+
+
+def test_sales_cannot_edit_colleagues_activity(db):
+    """销售改不了别人写的跟进，但删的权限是另一条规则（裁定 5）。
+
+    作者取本部门主管而不是同部门销售：真实写路径里销售写不了同事的客户，
+    "同事在我客户上写了跟进"只能由主管/管理员造成。
+    """
+    f = _setup(db)
+    activity = _insert(db, f["boss"], f["cust_a"], content="主管写的")
+
+    with pytest.raises(ForbiddenError):
+        update_activity(db, f["sa"], activity.id, ActivityUpdate(content="我改"))
+
+    # 但主管可以删（裁定 5），这是两条不同的权限
+    delete_activity(db, f["boss"], activity.id)
+    db.expire_all()
+    assert db.get(Activity, activity.id).deleted_at is not None
+
+
+def test_manager_cannot_edit_but_can_delete_department_activity(db):
+    f = _setup(db)
+    activity = _insert(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(ForbiddenError):
+        update_activity(db, f["boss"], activity.id, ActivityUpdate(content="主管改"))
+
+    delete_activity(db, f["boss"], activity.id)
+
+
+def test_delete_activity_is_soft_and_repeat_is_404(db):
+    f = _setup(db)
+    activity = _insert(db, f["sa"], f["cust_a"])
+
+    delete_activity(db, f["sa"], activity.id)
+    db.expire_all()
+    row = db.get(Activity, activity.id)
+    assert row is not None and row.deleted_at is not None
+
+    with pytest.raises(NotFoundError):
+        delete_activity(db, f["sa"], activity.id)
+
+
+def test_admin_can_delete_any_activity(db):
+    f = _setup(db)
+    activity = _insert(db, f["sb"], f["cust_b"])
+    delete_activity(db, f["admin"], activity.id)
