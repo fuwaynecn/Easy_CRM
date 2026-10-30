@@ -15,9 +15,6 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
-# 以模块方式导入，看板截断测试要 monkeypatch.BOARD_COLUMN_LIMIT（`from ... import board`
-# 拿到的是函数对象，改不到它读的模块全局量）
-import app.modules.opportunities.service as opportunity_service
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
 from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
@@ -888,10 +885,50 @@ def test_board_truncates_items_but_keeps_full_totals(db, monkeypatch):
     f = _setup(db)
     _make(db, f["sa"], f["cust_a"], name="甲单", amount=Decimal(100))
     _make(db, f["sa"], f["cust_a"], name="乙单", amount=Decimal(250))
-    monkeypatch.setattr(opportunity_service, "BOARD_COLUMN_LIMIT", 1)
+    monkeypatch.setattr("app.modules.opportunities.service.reads.BOARD_COLUMN_LIMIT", 1)
 
     column = {column.stage: column for column in board(db, f["sa"])}["contact"]
 
     assert column.total == 2                 # 聚合不受截断影响
     assert len(column.items) == 1            # 明细被截到上限
     assert column.amount_total == Decimal("350.00")
+
+
+def test_list_total_excludes_soft_deleted(db):
+    """软删的机会要从 `list` 的 total 里消失，不只是从详情里消失。
+
+    P2 只测了详情 404；`total` 若仍把软删行算进去，前端分页会出现"共 3 条、只见 2 条"。
+    """
+    f = _setup(db)
+    kept = _make(db, f["sa"], f["cust_a"], name="保留的单")
+    gone = _make(db, f["sa"], f["cust_a"], name="要删的单")
+    # 删机会限主管及以上（writes.delete_opportunity 的既有规则），故由 boss 删；
+    # 断言仍用销售 sa 的视角看列表，测的才是「软删行不该进 total」本身。
+    delete_opportunity(db, f["boss"], gone.id)
+
+    items, total = list_opportunities(db, f["sa"])
+
+    assert total == 1
+    assert [item.id for item in items] == [kept.id]
+
+
+def test_pool_customer_opportunity_cannot_change_stage(db):
+    """公海客户名下已有机会时，销售改阶段是 403（公海只读，读得到不等于能改）。
+
+    P2 只测了"公海客户不能建机会"；已有机会的写入路径同样必须被挡住，否则
+    `assert_customer_writable` 少走一步就能把在谈的单推成赢单。
+    """
+    f = _setup(db)
+    opportunity = _make(db, f["sa"], f["cust_a"], name="已分配时的单")
+    # 模拟 P4 的回收：客户回到公海，机会仍在（P4 才真正实现，这里只改这一列）
+    customer = db.get(Customer, f["cust_a"].id)
+    customer.owner_id = None
+    customer.department_id = None
+    db.commit()
+
+    with pytest.raises(ForbiddenError) as exc:
+        change_stage(db, f["sa"], opportunity.id, StageChange(stage="needs"))
+
+    assert "公海" in str(exc.value)
+    db.expire_all()
+    assert db.get(Opportunity, opportunity.id).stage == "contact"
