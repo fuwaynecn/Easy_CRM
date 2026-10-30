@@ -10,7 +10,9 @@
 6. 重名先 409（``detail.similar`` 为 ``[{id, name}]``）→ ``force=true`` 成功 →
    紧接着再建同名仍 409（force 只对当次生效）；
 7. （P2）机会从 contact 一路推到 won → 主管重开 → 标 lost，接口派生值、库里的
-   终态字段、``stage_histories`` 的 from/to 序列三处必须互相对齐。
+   终态字段、``stage_histories`` 的 from/to 序列三处必须互相对齐；
+8. （P3）写跟进（带下次待办）→ 首页今日待办 → 完成待办（回写跟进）→ 时间线两条倒序 →
+   首页清空，外加游标翻页不重不漏。
 
 与 brief 样例的差异（样例写于早期，按现状改写）：联系人改/删走扁平
 ``PATCH|DELETE /api/v1/contacts/{id}``（嵌套写路由已删除）；``create_user`` 要求
@@ -578,3 +580,127 @@ def test_opportunity_lifecycle_end_to_end(client, db):
     assert opportunity.lost_reason_id == reason.id
     assert opportunity.lost_note == "客户把预算挪到明年"
     assert str(opportunity.amount) == "200000.00"
+
+
+def test_p3_follow_up_loop(client, db):
+    """P3 主链路：写跟进（顺手排待办）→ 首页今日待办 → 完成并回写跟进 → 时间线两条 → 首页清空。
+
+    这条用例存在的意义是**跨模块**：activity 写侧、follow_ups 写侧、home 聚合、timeline
+    合并四处各自单测都绿，但"待办完成后首页消失、时间线多一条"只有连起来跑才成立。
+
+    自带夹具，不复用 `_setup` 的内部字典键——那边服务于 P2 的权限矩阵，按键名耦合会让
+    两边一改就互相绊倒。
+
+    待办到期时间取「此刻」而不是「明天」：`/home` 的今日块是半开区间
+    `[上海零点, 次日零点)`，此刻必然落在其中，因此这条断言不依赖测试运行的具体时刻；
+    按裁定「今天已过点仍算今日待办」，它是今日待办而不是逾期。
+    """
+    from datetime import UTC, datetime
+
+    from app.modules.departments.service import create_department
+    from app.modules.users.models import ROLE_SALES
+    from app.modules.users.service import create_user
+
+    department = create_department(db, "P3 验收部")
+    create_user(
+        db,
+        username="p3_sales",
+        password=PASSWORD,
+        display_name="P3 销售",
+        role=ROLE_SALES,
+        department_id=department.id,
+    )
+    headers = _auth(client, "p3_sales")
+
+    created_customer = client.post(
+        "/api/v1/customers", headers=headers, json={"name": "P3 贯通客户有限公司"}
+    )
+    assert created_customer.status_code == 201, created_customer.text
+    customer_id = created_customer.json()["id"]
+    assert created_customer.json()["last_activity_at"] is None
+
+    # 1) 写跟进 + 顺手排一条今天到期的待办
+    now = datetime.now(UTC)
+    created = client.post(
+        "/api/v1/activities",
+        headers=headers,
+        json={
+            "customer_id": customer_id,
+            "type": "call",
+            "content": "确认技术参数",
+            "next_follow_up": {"due_at": now.isoformat(), "content": "寄样册"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    activity_id = created.json()["id"]
+    # 写活动会推进客户新鲜度（design §3.3）：否则首页"即将进公海"会立刻把新客户算进去
+    detail = client.get(f"/api/v1/customers/{customer_id}", headers=headers).json()
+    assert detail["last_activity_at"] is not None
+
+    # 2) 首页：今日待办里有它，逾期与公海预警都没有
+    home = client.get("/api/v1/home", headers=headers)
+    assert home.status_code == 200, home.text
+    home_body = home.json()
+    assert set(home_body) == {"today", "overdue", "pool_notice"}
+    today = home_body["today"]
+    assert today["total"] == 1
+    assert [item["content"] for item in today["items"]] == ["寄样册"]
+    assert today["items"][0]["customer_name"] == "P3 贯通客户有限公司"
+    assert home_body["overdue"]["total"] == 0
+    # 刚写过的客户不可能进预警区间：27 天瞬时阈值
+    assert home_body["pool_notice"]["total"] == 0
+
+    # 3) 「我的待办」列表里也是同一条（首页与列表必须同源）
+    todos = client.get("/api/v1/follow_ups?mine=true", headers=headers)
+    assert todos.status_code == 200, todos.text
+    assert todos.json()["total"] == 1
+    todo_id = todos.json()["items"][0]["id"]
+    assert todos.json()["items"][0]["status"] == "pending"
+
+    # 4) 完成待办并顺便写跟进
+    done = client.post(
+        f"/api/v1/follow_ups/{todo_id}/done",
+        headers=headers,
+        json={"create_activity": True, "activity_type": "visit"},
+    )
+    assert done.status_code == 200, done.text
+    assert done.json()["follow_up"]["status"] == "done"
+    assert done.json()["follow_up"]["done_at"] is not None
+    assert done.json()["activity"]["content"] == "寄样册"
+    assert done.json()["activity"]["type"] == "visit"
+
+    # 5) 首页不再有它：两个块都空（完成 ≠ 逾期，也不是被藏起来）
+    home_after = client.get("/api/v1/home", headers=headers).json()
+    assert home_after["today"]["total"] == 0
+    assert home_after["overdue"]["total"] == 0
+    assert home_after["today"]["items"] == []
+
+    # 6) 时间线两条，倒序（完成待办产生的那条在前）；没有阶段变更
+    timeline = client.get(f"/api/v1/customers/{customer_id}/timeline", headers=headers)
+    assert timeline.status_code == 200, timeline.text
+    timeline_body = timeline.json()
+    assert all(item["type"] == "activity" for item in timeline_body["items"])
+    assert [item["content"] for item in timeline_body["items"]] == ["寄样册", "确认技术参数"]
+    assert [item["activity_type"] for item in timeline_body["items"]] == ["visit", "call"]
+    # 单页装得下 → 不发行游标，前端拿到 next_cursor=null 就不会显示「加载更多」
+    assert timeline_body["next_cursor"] is None
+
+    # 7) 分页契约：limit=1 时给游标，翻页不重不漏
+    first_page = client.get(
+        f"/api/v1/customers/{customer_id}/timeline?limit=1", headers=headers
+    ).json()
+    assert len(first_page["items"]) == 1
+    assert first_page["next_cursor"] is not None
+    second_page = client.get(
+        f"/api/v1/customers/{customer_id}/timeline",
+        headers=headers,
+        params={"limit": 1, "cursor": first_page["next_cursor"]},
+    )
+    assert second_page.status_code == 200, second_page.text
+    second_body = second_page.json()
+    assert len(second_body["items"]) == 1
+    assert second_body["items"][0]["id"] != first_page["items"][0]["id"]
+    assert second_body["next_cursor"] is None
+    # 第二页就是最初那条跟进：activity 主键与时间线条目的 id 同源
+    assert second_body["items"][0]["id"] == activity_id
+    assert second_body["items"][0]["content"] == "确认技术参数"
