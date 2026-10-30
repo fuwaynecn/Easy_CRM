@@ -6,13 +6,19 @@ import { ApiError, errorMessage } from "../api/client";
 import { createContact, deleteContact, listContacts, updateContact } from "../api/contacts";
 import type { ContactBody } from "../api/contacts";
 import { getCustomer, updateCustomer } from "../api/customers";
+import { completeFollowUp, listFollowUps, updateFollowUp } from "../api/followUps";
 import { listOpportunities } from "../api/opportunities";
-import type { Contact, Customer } from "../api/types";
+import type { Contact, Customer, FollowUp } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
+import { ActivityFormModal } from "../components/ActivityFormModal";
+import type { ActivityDraft } from "../components/ActivityFormModal";
 import { Field, TextArea } from "../components/Field";
+import { FollowUpDoneModal } from "../components/FollowUpDoneModal";
+import { FollowUpFormModal } from "../components/FollowUpFormModal";
 import { Modal } from "../components/Modal";
 import { OpportunityFormModal } from "../components/OpportunityFormModal";
 import { QueryError } from "../components/QueryError";
+import { Timeline } from "../components/Timeline";
 import {
   BUDGET_STATUS_LABELS,
   DECISION_ROLE_LABELS,
@@ -20,6 +26,7 @@ import {
   PROCUREMENT_TYPE_LABELS,
   labelOf,
 } from "../constants/customerLabels";
+import { formatClock, formatDay } from "../constants/datetime";
 import {
   STAGE_BADGE_CLASS,
   STAGE_LABELS,
@@ -61,6 +68,15 @@ const EMPTY_CONTACT_FORM: ContactFormState = {
 /** 后端把清空的字段存成空串，`??` 兜不住，统一按"没填"显示成破折号。 */
 function textOf(value: string | null | undefined): string {
   return value !== null && value !== undefined && value.trim() !== "" ? value : "—";
+}
+
+/**
+ * 待办是否已逾期。与首页「已逾期」同一口径（瞬时比较），但首页那套边界由后端算；
+ * 这里只用于把详情页待办卡的时间标红，标签文案不参与任何业务判定。
+ */
+function isOverdue(dueAt: string): boolean {
+  const due = new Date(dueAt);
+  return !Number.isNaN(due.getTime()) && due.getTime() < Date.now();
 }
 
 /**
@@ -168,6 +184,23 @@ export default function CustomerDetailPage() {
     enabled: validId && customerQuery.isSuccess,
   });
 
+  // 待办的可见性继承客户（后端 `get_customer` 先判作用域）；这里只取"未完成、最近
+  // 5 条"，全量在首页按天汇总——详情页不是待办管理台。
+  // key 落在 `["follow_ups"]` 前缀下：写跟进/新建待办/完成待办都按这个前缀失效，
+  // 这张卡因此不需要各自再通知一遍。
+  const followUpsQuery = useQuery({
+    queryKey: ["follow_ups", customerId, "pending"],
+    queryFn: () => listFollowUps({ customer_id: customerId, status: "pending", page_size: 5 }),
+    enabled: validId,
+  });
+
+  const [showActivityForm, setShowActivityForm] = useState(false);
+  const [activityDraft, setActivityDraft] = useState<ActivityDraft | null>(null);
+  const [showFollowUpForm, setShowFollowUpForm] = useState(false);
+  const [doneTarget, setDoneTarget] = useState<FollowUp | null>(null);
+  const [doneError, setDoneError] = useState<string | null>(null);
+  const [todoError, setTodoError] = useState<string | null>(null);
+
   const saveCustomer = useMutation({
     mutationFn: () => updateCustomer(customerId, { address: address.trim(), remark: remark.trim() }),
     onMutate: () => {
@@ -226,6 +259,41 @@ export default function CustomerDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ["contacts", customerId] });
     },
     onError: (err) => setDeleteError(errorMessage(err, "删除失败，请重试")),
+  });
+
+  const completeTodo = useMutation({
+    mutationFn: (input: { id: number; createActivity: boolean; activityType: string }) =>
+      completeFollowUp(input.id, {
+        create_activity: input.createActivity,
+        // 不勾选就不传 activity_type：后端对"不勾选却指定方式"返回 400
+        ...(input.createActivity ? { activity_type: input.activityType } : {}),
+      }),
+    onSuccess: async () => {
+      setDoneTarget(null);
+      setDoneError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["follow_ups", customerId, "pending"] }),
+        queryClient.invalidateQueries({ queryKey: ["timeline", customerId] }),
+        queryClient.invalidateQueries({ queryKey: ["home"] }),
+        queryClient.invalidateQueries({ queryKey: ["customer", customerId] }),
+        // 勾选写跟进会推进 last_activity_at，客户列表的「最后跟进」也要跟着变
+        queryClient.invalidateQueries({ queryKey: ["customers"] }),
+      ]);
+    },
+    onError: (err) => setDoneError(errorMessage(err, "标记完成失败")),
+  });
+
+  const cancelTodo = useMutation({
+    // 取消是状态变更（cancelled），不是物理删除：历史仍可追溯
+    mutationFn: (id: number) => updateFollowUp(id, { status: "cancelled" }),
+    onSuccess: async () => {
+      setTodoError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["follow_ups", customerId, "pending"] }),
+        queryClient.invalidateQueries({ queryKey: ["home"] }),
+      ]);
+    },
+    onError: (err) => setTodoError(errorMessage(err, "取消待办失败")),
   });
 
   function openCreateContact() {
@@ -570,6 +638,91 @@ export default function CustomerDetailPage() {
             </>
           )}
         </section>
+
+        {/* 待办区放右栏：它是"下一步做什么"，与联系人同属这个客户的操作信息。
+            只列未完成的前 5 条（后端按 due_at 升序），全量在首页按天汇总。 */}
+        <section className="min-w-0 space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-slate-900">待办</h2>
+            {writable ? (
+              <button
+                type="button"
+                onClick={() => setShowFollowUpForm(true)}
+                className="shrink-0 rounded-md border border-slate-300 px-2.5 py-1 text-sm hover:bg-slate-100"
+              >
+                + 新建
+              </button>
+            ) : (
+              <span className="shrink-0 text-xs text-slate-500">只读</span>
+            )}
+          </div>
+
+          {followUpsQuery.isError ? (
+            <p className="break-words text-sm text-red-600">
+              {errorMessage(followUpsQuery.error, "待办加载失败")}
+            </p>
+          ) : followUpsQuery.isPending ? (
+            <p className="text-sm text-slate-500">加载中…</p>
+          ) : (followUpsQuery.data?.items.length ?? 0) === 0 ? (
+            <p className="break-words rounded-md bg-slate-50 p-3 text-sm text-slate-500">
+              {writable
+                ? "没有未完成的待办。用「+ 新建」给自己排一条，到期后会出现在首页。"
+                : "该客户没有未完成的待办。"}
+            </p>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {(followUpsQuery.data?.items ?? []).map((todo) => (
+                <li key={todo.id} className="flex items-start justify-between gap-2 py-2">
+                  <div className="min-w-0 space-y-0.5">
+                    <p className="break-words text-sm text-slate-900">{todo.content}</p>
+                    <p
+                      className={`break-words text-xs ${
+                        isOverdue(todo.due_at) ? "text-red-600" : "text-slate-500"
+                      }`}
+                    >
+                      {formatDay(todo.due_at)}
+                      {" · "}
+                      {isOverdue(todo.due_at) ? "已逾期" : `${formatClock(todo.due_at)} 前`}
+                    </p>
+                  </div>
+                  {writable ? (
+                    <div className="flex shrink-0 items-center gap-2 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDoneError(null);
+                          setDoneTarget(todo);
+                        }}
+                        className="text-slate-500 hover:text-brand-600"
+                      >
+                        完成
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cancelTodo.isPending}
+                        onClick={() => {
+                          setTodoError(null);
+                          cancelTodo.mutate(todo.id);
+                        }}
+                        className="text-slate-400 hover:text-red-600 disabled:opacity-60"
+                      >
+                        取消
+                      </button>
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {(followUpsQuery.data?.total ?? 0) > (followUpsQuery.data?.items.length ?? 0) ? (
+            <p className="text-xs text-slate-400">
+              共 {followUpsQuery.data?.total} 条未完成，这里只显示最近 5 条。
+            </p>
+          ) : null}
+
+          {todoError ? <p className="break-words text-sm text-red-600">{todoError}</p> : null}
+        </section>
       </div>
 
       {/* 机会区放在两栏之外、整行铺满：机会是"这个客户在谈什么"的主线，塞进
@@ -638,6 +791,91 @@ export default function CustomerDetailPage() {
           </ul>
         )}
       </section>
+
+      {/* 跟进时间线（spec §6.2）：与机会区同为主线段，整行铺满。
+          条目由后端合并 activity 与 stage_change 并倒序，前端不重排。 */}
+      <section className="min-w-0 space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-slate-900">跟进时间线</h2>
+          {writable ? (
+            <button
+              type="button"
+              onClick={() => {
+                setActivityDraft(null);
+                setShowActivityForm(true);
+              }}
+              className="shrink-0 rounded-md border border-slate-300 px-2.5 py-1 text-sm hover:bg-slate-100"
+            >
+              + 写跟进
+            </button>
+          ) : (
+            <span className="shrink-0 text-xs text-slate-500">只读</span>
+          )}
+        </div>
+        {/* 时间线自带加载更多与空态；客户不可见时这里根本不会渲染（上方已 return） */}
+        <Timeline
+          customerId={customerId}
+          onEdit={(draft) => {
+            setActivityDraft(draft);
+            setShowActivityForm(true);
+          }}
+        />
+      </section>
+
+      {/* 移动端悬浮「+ 跟进」（spec §6.3）：桌面端已有卡片右上角入口，故 lg 以上隐藏。
+          bottom-20 避开 iOS 浏览器底栏；z-30 低于弹窗（Modal 是 z-40+）。 */}
+      {writable ? (
+        <button
+          type="button"
+          onClick={() => {
+            setActivityDraft(null);
+            setShowActivityForm(true);
+          }}
+          className="fixed bottom-20 right-4 z-30 rounded-full bg-brand-600 px-5 py-3 text-sm font-medium text-white shadow-lg lg:hidden"
+        >
+          + 跟进
+        </button>
+      ) : null}
+
+      {showActivityForm ? (
+        <ActivityFormModal
+          customerId={customerId}
+          draft={activityDraft ?? undefined}
+          onClose={() => {
+            setShowActivityForm(false);
+            setActivityDraft(null);
+          }}
+          onSaved={() => {
+            setShowActivityForm(false);
+            setActivityDraft(null);
+          }}
+        />
+      ) : null}
+
+      {showFollowUpForm ? (
+        <FollowUpFormModal
+          customerId={customerId}
+          contactOptions={contacts}
+          opportunityOptions={opportunitiesQuery.data?.items ?? []}
+          onClose={() => setShowFollowUpForm(false)}
+          onSaved={() => setShowFollowUpForm(false)}
+        />
+      ) : null}
+
+      {doneTarget ? (
+        <FollowUpDoneModal
+          followUp={doneTarget}
+          pending={completeTodo.isPending}
+          error={doneError}
+          onClose={() => {
+            setDoneTarget(null);
+            setDoneError(null);
+          }}
+          onSubmit={(createActivity, activityType) =>
+            completeTodo.mutate({ id: doneTarget.id, createActivity, activityType })
+          }
+        />
+      ) : null}
 
       {contactModal !== null ? (
         <Modal
