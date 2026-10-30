@@ -7,8 +7,9 @@
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from app.modules.activities.models import Activity
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
@@ -120,6 +121,11 @@ def test_create_activity_with_next_follow_up_creates_todo(client, db):
 
 
 def test_pool_customer_activity_is_403(client, db):
+    """公海客户不可写跟进：HTTP 层 403，且**一行都没落库**。
+
+    只断言 403 是不够的：路由若先建行再在序列化/提交阶段报错，状态码可能仍是 403，
+    而库里已经多了一条跟进（下一次列表就能看到公海客户凭空多出一条记录）。
+    """
     f = _setup(db)
     headers = _auth(client, "sales_a")
 
@@ -131,6 +137,9 @@ def test_pool_customer_activity_is_403(client, db):
 
     assert resp.status_code == 403
     assert resp.json()["code"] == "forbidden"
+    # 同一会话里计数：不 expire 也能看到本事务的写入，所以这里刻意不 expire——
+    # 要证明的正是"没有写入发生"，而不是"写入被别的会话挡住了"。
+    assert db.execute(select(func.count()).select_from(Activity)).scalar_one() == 0
 
 
 def test_request_body_whitelist_is_enforced(client, db):

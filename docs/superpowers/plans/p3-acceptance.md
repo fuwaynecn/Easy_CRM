@@ -80,7 +80,7 @@ npm.cmd run dev
 
 | 账号 | 姓名 | 角色 | 部门 | P3 关注点 |
 |---|---|---|---|---|
-| `admin` | 系统管理员 | 管理员 | 无 | 首页也是"我名下客户"（裁定 3 字面），所以**首页三块为空是预期** |
+| `admin` | 系统管理员 | 管理员 | 无 | 「今日待办/已逾期」按客户负责人算，admin 名下没有客户 → **这两块恒为空是预期**；「即将进公海」按可见范围算（admin 全部）→ **会列出别人名下的客户**，也不是缺陷 |
 | `boss` | 李建国 | 主管 | 华东 | 时间线看得到本部门客户；行内无编辑/删除（已知限制） |
 | `sales1` | 张明 | 销售 | 华东 | 杭州智造（名下）+ 苏州新能源（公海只读） |
 | `sales2` | 王丽 | 销售 | 华南 | 广州鼎盛、宁波海天 |
@@ -99,17 +99,17 @@ npm.cmd run dev
 | spec 条款 | 实现位置 | 证据 | 结论 |
 |---|---|---|---|
 | §3.3 `last_activity_at` 只在新建 activity 时更新，编辑/删除不回算（裁定 8） | `backend/app/modules/activities/service.py` | `test_activities.py::test_create_sets_last_activity_at`、`::test_update_activity_never_touches_last_activity_at`、`::test_delete_activity_never_touches_last_activity_at`、`::test_backdated_activity_does_not_roll_back_last_activity_at` | 三条维护点与"不碰"都有断言；补写一条更早时间的跟进不会把客户时钟往回拨 |
-| §3.3 公海客户不可写跟进 | `activities/service.py`、`scope.py` | `test_activities.py::test_create_activity_on_pool_customer_is_403_for_sales`、`test_activities_api.py::test_pool_customer_activity_is_403` | 403 `forbidden`，且库里 activity 数量不变（两层都钉了：服务层 + HTTP 层） |
+| §3.3 公海客户不可写跟进 | `activities/service.py`、`scope.py` | `test_activities.py::test_create_activity_on_pool_customer_is_403_for_sales`、`test_activities_api.py::test_pool_customer_activity_is_403` | 两层都钉了 403 `forbidden`；HTTP 用例在 403 之后还断言 `select(count(*)).select_from(Activity) == 0`（未落库） |
 | §3.8 activity 字段与类型枚举 | `activities/models.py`、`schemas.py`、迁移 `3199fb8aa5f9` | `test_activities.py::test_activity_type_tuple_matches_spec`、`::test_activity_table_is_registered_in_metadata`、`test_migrations.py::test_migrated_schema_keeps_named_checks_and_column_defaults` | 六个 `type` 值由命名 CHECK 钉住；裸 INSERT 非法值报 IntegrityError |
 | §3.8 关联对象必须是本客户且可见 | `activities/service.py` | `test_activities.py::test_create_activity_rejects_contact_from_another_customer`、`::test_create_activity_rejects_opportunity_from_another_customer`、`::test_child_links_soft_deleted_is_not_found` | 400/404；跨客户关联与"关联到已软删对象"都被拒 |
 | §3.9 待办表结构、索引、`status` 三态 | `followups/models.py`、迁移 `aca0bc139888` | `test_follow_ups.py::test_follow_up_table_is_registered_with_spec_columns`、`::test_follow_up_statuses_match_spec`、`test_migrations.py::test_migrations_match_models` | 列与命名 CHECK 逐项对齐 spec §3.9；两条索引（`(status,due_at)`、`(customer_id,status,due_at)`）由模型声明、经 `compare_metadata` 与迁移产物比对（无差异） |
 | §3.9 待办跟着客户走（「我的待办」= 客户负责人） | `followups/service.py::list_follow_ups` | `test_follow_ups.py::test_mine_filter_is_customer_owner_not_created_by`、`::test_creator_can_edit_todo_on_others_customer`、`test_home.py::test_only_my_todos` | 接手人能看到前任留的待办；`created_by` 不是过滤条件 |
 | §4.5 写跟进 + 可选下次跟进同事务建待办 | `activities/service.py::create_activity` | `test_activities.py::test_create_activity_with_next_follow_up_creates_pending_todo`、`::test_failed_next_follow_up_rolls_back_everything`、`test_activities_api.py::test_create_activity_with_next_follow_up_creates_todo`、`test_e2e.py::test_p3_follow_up_loop` | 201 之后有且仅有 1 条 pending，内容/到期与请求一致；待办写入失败时跟进一起回滚 |
-| §4.5 完成待办可"顺便写条跟进"，并刷新 `last_activity_at` | `followups/service.py::complete_follow_up` | `test_follow_ups.py::test_complete_with_activity_copies_content_and_bumps_last_activity`、`::test_complete_without_ticking_but_passing_type_is_400`、`test_follow_ups_api.py::test_done_returns_follow_up_and_activity`、`test_e2e.py::test_p3_follow_up_loop` | 返回 `{follow_up: done, activity: 同内容}`；未勾选却传 `activity_type` 是 400；客户 `last_activity_at` 前移 |
+| §4.5 完成待办可"顺便写条跟进"，并刷新 `last_activity_at` | `followups/service.py::complete_follow_up` | `test_follow_ups.py::test_complete_with_activity_copies_content_and_bumps_last_activity`、`::test_complete_without_ticking_but_passing_type_is_400`、`test_follow_ups_api.py::test_done_returns_follow_up_and_activity`、`test_e2e.py::test_p3_follow_up_loop` | 返回 `{follow_up: done, activity: 同内容}`；未勾选却传 `activity_type` 是 400；客户 `last_activity_at` **由 `NULL` 变为非空**（断言 `is not None`，不断言具体时刻） |
 | §4.5 完成只能走 `/done`（裁定 10） | `followups/router.py`、`schemas.py` | `test_follow_ups.py::test_patch_status_done_is_rejected`、`::test_complete_twice_is_400`、`test_follow_ups_api.py::test_create_list_patch_cancel` | PATCH `status="done"` → 400；重复完成 → 400（不会重复写跟进） |
 | §4.5 逾期定义 `due_at < 今天0点(Asia/Shanghai)` 且 pending | `home/service.py::today_bounds` | `test_home.py::test_today_and_overdue_split_by_shanghai_midnight`、`::test_utc_day_boundary_is_not_used`、`::test_day_bounds_are_half_open` | 用上海零点切分而非 UTC；日界半开 `[start, end)` |
 | §4.5 完成/取消态冻结（不可再改内容） | `followups/service.py` | `test_follow_ups.py::test_completed_follow_up_cannot_change_status`、`::test_completed_follow_up_cannot_change_content_or_due_at`、`::test_cancelled_follow_up_cannot_change_content_but_can_reopen`、`::test_patch_cancelled_then_reopen` | 已完成行内容/到期/状态都改不动；已取消行只能"重开"，不能直接改成 done |
-| §5 错误统一 `{code, message, detail}` | `app/main.py` 异常处理器 | `test_errors.py`（6 条）、`test_activities_api.py::test_pagination_bounds_are_rejected` | 400/401/403/404/422 五种都有 envelope；分页越界是 422 而不是 500 |
+| §5 错误统一 `{code, message, detail}` | `app/main.py` 异常处理器 | `test_errors.py`（6 条）、`test_auth.py`（401/登录失败等 envelope）、`test_activities_api.py::test_pagination_bounds_are_rejected` | 400/401/403/404/422 五种都有 envelope；分页越界是 422 而不是 500 |
 | §5 分页 `{items,total,page,page_size}`、`page_size ≤ 200` | `activities/router.py`、`followups/router.py`（`PageParams`） | `test_activities_api.py::test_pagination_bounds_are_rejected`、`test_follow_ups_api.py::test_create_list_patch_cancel` | `page_size=201`/`page=0` → 422 `validation_error` |
 | §5 时间一律带偏移的 ISO | `schemas.py`（`datetime` 直出） | `test_activities_api.py::test_create_and_list_activity_through_http`（`fromisoformat` + tzinfo 断言） | 线上形如 `2026-10-31T09:00:00+08:00`；前端必须 `new Date()` 解析 |
 | §5 时间线合并 activities + stage_histories 并倒序，游标 `(occurred_at,type,id)` | `timeline/service.py`、`timeline/cursor` 逻辑在同文件 | `test_timeline.py::test_timeline_merges_activities_and_stage_changes_desc`、`::test_timeline_cursor_pages_without_gap_or_duplicate`、`::test_timeline_cursor_roundtrip_and_invalid_cursor` | 合并排序正确；翻页不重不漏；非法游标 400（不是 500） |
@@ -118,8 +118,8 @@ npm.cmd run dev
 | §5 时间线不返回已软删的 activity | `timeline/service.py` | `test_timeline.py::test_timeline_hides_soft_deleted_activity` | 删掉的跟进不再出现在时间线（与"已删机会的 stage_change 仍显示"是两回事） |
 | §5 `owner_change` 只预留、游标拒绝（裁定 6/14） | `timeline/service.py` | `test_timeline.py::test_timeline_cursor_rejects_unimplemented_owner_change_type` | 手工构造该类型游标 → 400 |
 | §6.1 `/` 是首页三块 | `frontend/src/pages/HomePage.tsx`、`App.tsx` | `npm.cmd run build` + §4 第 1–7 条 | 构建过类型检查；渲染只能手测 |
-| §6.1 首页「今日待办 / 已逾期 / 即将进公海」口径（裁定 2/13） | `home/service.py`、`pools/rules.py` | `test_home.py::test_today_and_overdue_split_by_shanghai_midnight`、`::test_pool_notice_uses_27_day_threshold`、`::test_pool_notice_excludes_customers_with_open_deal`、`::test_pool_notice_excludes_customers_with_pending_todo`、`::test_pool_notice_excludes_pool_inactive_and_never_followed` | 27 天瞬时阈值 + 两条豁免 + "从未跟进不预警"逐条钉住 |
-| §6.1 首页作用域 = 我名下客户 | `home/service.py` | `test_home.py::test_only_my_todos`、`::test_pool_notice_is_scoped_to_visible_customers` | admin 也只看"我名下"（裁定 3 的字面口径） |
+| §6.1 首页「今日待办 / 已逾期 / 即将进公海」口径（裁定 2/13） | `home/service.py`、`pools/rules.py` | `test_home.py::test_today_and_overdue_split_by_shanghai_midnight`、`::test_pool_notice_uses_27_day_threshold`、`::test_pool_notice_excludes_customers_with_open_deal`、`::test_pool_notice_excludes_customers_with_pending_todo`、`::test_pool_notice_excludes_pool_inactive_and_never_followed` | 预警线是**夹逼**出来的：`_age_customer(days=28)` 进预警、`days=26` 不进（`last_activity_at < now-27d` 是严格 `<`，不含等号）。**27 天整这个点本身没有被实测**，它由常量表达式 `NOTICE_THRESHOLD_DAYS = INACTIVE_DAYS - RECYCLE_NOTICE_DAYS`（30−3）与 `test_rules_are_spec_derived` 保证；另有两条豁免 + "从未跟进不预警"逐条钉住 |
+| §6.1 首页作用域：今日/逾期按**客户负责人**，预警按**可见范围** | `home/service.py`（`_my_customers` vs `customer_query(actor)`） | `test_home.py::test_only_my_todos`、`::test_pool_notice_is_scoped_to_visible_customers` | 两块用的不是同一个过滤：`today`/`overdue` 只认 `customers.owner_id = me`；`pool_notice` 走 `customer_query(actor)`（admin 全部、主管本部门、销售自己+公海）。所以 **admin 的今日/逾期为空、预警会列出别人名下的客户**，都不算缺陷 |
 | §6.1 每块最多 50 条但 `total` 是全量 | `home/service.py`（`HOME_BLOCK_LIMIT`） | `test_home.py::test_home_block_limit_truncates` | `items` 截断为 50，`total` 仍是真实总数 |
 | §6.3 移动端悬浮「+ 跟进」 | `CustomerDetailPage.tsx`（`lg:hidden` + `bottom-20`） | `npm.cmd run build` + §4 第 13–14 条 | 只能手测（无前端测试框架） |
 | 前端契约层（类型/日期/金额） | `api/types.ts`、`constants/datetime.ts`、`api/{activities,followUps,home,timeline}.ts` | `npm.cmd run build`（`tsc --noEmit`） | 109 modules 通过；时间格式统一 `hourCycle:"h23"` |
@@ -181,6 +181,9 @@ npm.cmd run dev
   `UPDATE customers SET last_activity_at = now() - interval '28 days' WHERE name = '杭州智造装备有限公司';`
 - 预期：首页出现该客户，`负责人 张明 · 已 28 天无跟进` + 琥珀色 `即将进公海`。
 - 预期：给它加一条 pending 待办后**从预警消失**（有未完成待办豁免）；给它建一条没关闭的机会也会消失。
+- 预期（换个账号再看一次）：同一时刻用 **`admin`** 打开首页，「今日待办」「已逾期」是**空的**
+  （他名下没有客户），但「即将进公海」里**会看到张明名下的这个客户**——预警按可见范围（admin 全部）
+  而不是按负责人。这是两个不同的过滤，不是缺陷（见 §3 与 §5 #8）。
 - 恢复：把 `last_activity_at` 改回 `now()`。
 - 结论：☐ 通过　☐ 不通过　☐ 未验（数据构造成本高，自动化已覆盖）
 
@@ -291,8 +294,11 @@ npm.cmd run dev
    时间线显示 `¥0.00` 而不是"—"。P5 报表口径同样要处理这个歧义。
 7. **未捕获异常返回纯文本**：500 的 body 是 `Internal Server Error`（纯文本），不是 `{code,message,detail}`。
    已知与 §5 的契约不一致，P4 收口统一异常处理器。
-8. **`admin` 的首页也是"我名下客户"**：裁定 3 的字面口径（`customers.owner_id = me`），admin 名下没有客户，
-   所以**admin 登录后首页三块恒为空**。这是按裁定执行的，不是缺陷；P4 若要"管理员看全公司"，需要新裁定。
+8. **首页三块的可见范围不是同一个**：`today`/`overdue` 只认客户负责人（裁定 3），
+   `pool_notice` 走 `customer_query(actor)` 也就是**可见范围**（admin 全部 / 主管本部门 / 销售自己+公海）。
+   因此 **`admin` 登录后「今日待办」「已逾期」恒为空**（他名下没有客户），而「即将进公海」
+   **会列出全公司符合条件的客户**——两块都不能当缺陷报。P4 若要统一口径（例如管理员看全公司待办），
+   属于新裁定，需要同时改 `_my_customers` 与前端文案。
 9. **`.superpowers/sdd/**` 不入库**：`ledger.md`、`task-*-report.md`、`review-*.md` 只在本地（`.gitignore`）。
    交接给下一个会话时，能读到的只有本文件与 `docs/superpowers/handoffs/2026-11-01-p3-done-p4-next.md`。
 10. **e2e 只覆盖 HTTP 层**：`test_e2e.py::test_p3_follow_up_loop` 证明"写跟进→待办→首页→完成→时间线"
