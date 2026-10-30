@@ -9,11 +9,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import DEV_JWT_SECRET_PLACEHOLDER, settings
 from app.core.errors import AppError, error_response
+from app.modules.activities.router import router as activities_router
 from app.modules.auth.router import me_router
 from app.modules.auth.router import router as auth_router
 from app.modules.contacts.router import router as contacts_router
 from app.modules.customers.router import router as customers_router
 from app.modules.departments.router import router as departments_router
+from app.modules.followups.router import router as follow_ups_router
 from app.modules.home.router import router as home_router
 from app.modules.lost_reasons.router import router as lost_reasons_router
 from app.modules.opportunities.router import router as opportunities_router
@@ -117,6 +119,8 @@ def create_app() -> FastAPI:
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(customers_router, prefix="/api/v1")
     app.include_router(timeline_router, prefix="/api/v1")
+    app.include_router(activities_router, prefix="/api/v1")
+    app.include_router(follow_ups_router, prefix="/api/v1")
     app.include_router(contacts_router, prefix="/api/v1")
     app.include_router(lost_reasons_router, prefix="/api/v1")
     app.include_router(opportunities_router, prefix="/api/v1")
