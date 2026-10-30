@@ -19,7 +19,6 @@
 import re
 import unicodedata
 from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import Select, func, or_, select, update
 from sqlalchemy.orm import Session, joinedload
@@ -31,6 +30,7 @@ from app.core.errors import (
     NotFoundError,
 )
 from app.core.text import LIKE_ESCAPE, contains_pattern
+from app.core.timeutil import day_start
 from app.db.scope import assert_customer_writable, customer_query
 
 # 下面这行是**只读的过滤条件**（EXISTS 子查询），不是联系人数据的读取入口：联系人的
@@ -64,12 +64,7 @@ _NOISE = re.compile(r"[\s（）()【】\[\]·,，.。\-—_/\\]")
 
 # 日期筛选的"一天"按 Asia/Shanghai 计算（design §5 时区约定）：库里是 timestamptz，
 # 用户传的是无时区的日期，只有以本地零点换算成带偏移的时刻才能对上"当天"。
-_SHANGHAI = ZoneInfo("Asia/Shanghai")
-
-
-def _day_start(day: date) -> datetime:
-    """把日期解释成 Asia/Shanghai 当天 00:00（带偏移的 aware datetime）。"""
-    return datetime(day.year, day.month, day.day, tzinfo=_SHANGHAI)
+# 日界换算统一在 ``app/core/timeutil.py``（P3 起 activities / follow_ups / home 共用）。
 
 
 _SORTABLE = {
@@ -335,10 +330,10 @@ def list_customers(
     if owner_id is not None:
         stmt = stmt.where(Customer.owner_id == owner_id)
     if date_from is not None:
-        stmt = stmt.where(Customer.last_activity_at >= _day_start(date_from))
+        stmt = stmt.where(Customer.last_activity_at >= day_start(date_from))
     if date_to is not None:
         stmt = stmt.where(
-            Customer.last_activity_at < _day_start(date_to + timedelta(days=1))
+            Customer.last_activity_at < day_start(date_to + timedelta(days=1))
         )
 
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()

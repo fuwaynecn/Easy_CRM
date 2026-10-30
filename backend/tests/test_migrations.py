@@ -12,11 +12,13 @@
 
 from pathlib import Path
 
+import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 import app.db.models_registry  # noqa: F401  注册全部模型到 Base.metadata
 from alembic import command
@@ -28,6 +30,9 @@ ALEMBIC_INI = BACKEND_DIR / "alembic.ini"
 # 迁移里显式命名的 CHECK 约束。名字进首个迁移即固化，之后改名等于线上约束换了名字，
 # 依赖约束名的排查与运维脚本会静默失效，所以这里按集合包含钉死（新增约束不算漂移）。
 CHECK_CONSTRAINT_NAMES = {
+    "activities": {
+        "ck_activities_type",
+    },
     "opportunities": {
         "ck_opportunities_stage",
         "ck_opportunities_win_rate_range",
@@ -138,3 +143,22 @@ def test_migrated_schema_keeps_named_checks_and_column_defaults(engine: Engine) 
             {"opportunity_id": opportunity_id},
         ).scalar_one()
         assert history_changed_at is not None
+
+        # 跟进记录：type 非法必须被数据库挡住（绕过 service 的写入也进不来）
+        activity_at = connection.execute(
+            text(
+                "INSERT INTO activities (customer_id, type, content, activity_at, created_by) "
+                "VALUES (:customer_id, 'call', '迁移探针跟进', now(), :owner_id) "
+                "RETURNING activity_at"
+            ),
+            {"customer_id": customer_id, "owner_id": owner_id},
+        ).scalar_one()
+        assert activity_at is not None
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO activities (customer_id, type, content, activity_at, created_by) "
+                    "VALUES (:customer_id, 'telepathy', '非法类型', now(), :owner_id)"
+                ),
+                {"customer_id": customer_id, "owner_id": owner_id},
+            )

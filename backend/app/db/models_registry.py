@@ -3,6 +3,7 @@
 新增模型时，必须在这里追加一行导入，否则测试夹具建表会缺表。
 """
 
+from app.modules.activities.models import Activity  # noqa: F401
 from app.modules.contacts.models import Contact  # noqa: F401
 from app.modules.customers.models import Customer  # noqa: F401
 from app.modules.departments.models import Department  # noqa: F401
