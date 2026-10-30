@@ -127,9 +127,10 @@ npm.cmd run dev
 
 配套的横向证据（本文件写作时实测，原始输出见交接文档 §4）：
 
-- `pytest tests -q` → **541 passed**（P3 新增 120 条：`test_activities.py` 38 +
+- `pytest tests -q` → **541 passed**（P3 新增 120 条 `def test_`：`test_activities.py` 38 +
   `test_activities_api.py` 10、`test_follow_ups.py` 38 + `test_follow_ups_api.py` 8、
-  `test_timeline.py` 11、`test_home.py` 14、`test_e2e.py` +1；算术自检 421 + 120 = 541）
+  `test_timeline.py` 11、`test_home.py` 14、`test_e2e.py` +1；定义数 381→501，用例数 421→541，
+  差额是既有的 parametrize 展开）
 - `ruff check backend` → `All checks passed!`
 - `alembic heads` → 单头 `aca0bc139888`
 - `npm.cmd run build` → `109 modules`，`dist/index-*.js 281.33 kB`
