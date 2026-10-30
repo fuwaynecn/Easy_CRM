@@ -12,6 +12,7 @@ from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
+from app.core.timeutil import ensure_aware
 from app.db.scope import customer_query
 from app.modules.customers.models import Customer
 from app.modules.customers.service import get_customer
@@ -43,6 +44,7 @@ def create_pending_follow_up_in_tx(
     （activities.create_activity）。后者是跨模块调用，因此这里不校验权限、不 commit
     ——权限与事务由调用方负责，重复校验会让"谁能写待办"出现两个口径。
     """
+    due_at = ensure_aware(due_at, "待办到期时间")
     follow_up = FollowUp(
         customer_id=customer_id,
         contact_id=contact_id,

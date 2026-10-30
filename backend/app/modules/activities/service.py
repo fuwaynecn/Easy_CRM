@@ -12,7 +12,7 @@ from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
-from app.core.timeutil import day_bounds
+from app.core.timeutil import day_bounds, ensure_aware
 from app.db.scope import assert_customer_writable, customer_query
 from app.modules.activities.models import ACTIVITY_TYPES, Activity
 from app.modules.activities.schemas import ActivityCreate, ActivityUpdate
@@ -217,7 +217,8 @@ def create_activity(
         opportunity_id=payload.opportunity_id,
         type=payload.type,
         content=content,
-        activity_at=payload.activity_at or datetime.now(UTC),
+        activity_at=ensure_aware(payload.activity_at, "跟进时间")
+        or datetime.now(UTC),
         operator_id=actor.id,
     )
 
@@ -258,6 +259,10 @@ def update_activity(
         changes["content"] = _clean_content(changes["content"])
     if "activity_at" in changes and changes["activity_at"] is None:
         raise InvalidValueError("跟进时间不能为空")
+    if "activity_at" in changes:
+        changes["activity_at"] = ensure_aware(
+            changes["activity_at"], "跟进时间"
+        )
     for field, value in changes.items():
         setattr(activity, field, value)
     db.commit()

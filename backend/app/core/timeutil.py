@@ -8,7 +8,21 @@
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from app.core.errors import InvalidValueError
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def ensure_aware(value: datetime | None, label: str) -> datetime | None:
+    """拒收 naive 时间：没有时区的时间会被数据库 session 时区静默解释。
+
+    同一条 ``2026-10-31 01:00`` 在 UTC 库与上海时区库上差 8 小时，而且不报错——
+    属于"错得无声"的一类，写进库以后只能靠事后核对才能发现。入参为 ``None`` 时原样
+    返回（调用方自己决定"不传 = 现在"）。
+    """
+    if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+        raise InvalidValueError(f"{label}必须带时区")
+    return value
 
 
 def day_start(day: date) -> datetime:

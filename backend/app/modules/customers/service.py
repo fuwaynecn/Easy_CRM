@@ -460,6 +460,11 @@ def mark_customer_activity(
 
     本函数不 commit：调用方（写跟进、完成待办顺带写跟进）必须与业务行落在同一个
     事务里，否则会出现"跟进已入库、客户仍被视为僵尸"的中间态。
+
+    ``updated_at`` 显式 pin 成自身：``TimestampMixin`` 的列级 ``onupdate`` 会给任何
+    UPDATE 加上 ``updated_at=now()``，于是"写一条跟进"会把客户的「最后修改时间」
+    变成「最后跟进时间」（补录更早的跟进这种空转写入也会刷新它）。客户列表按
+    ``updated_at`` 排序/审计的语义不能被跟进写入带偏。
     """
     value = literal(occurred_at, type_=DateTime(timezone=True))
     db.execute(
@@ -468,6 +473,7 @@ def mark_customer_activity(
         .values(
             last_activity_at=func.greatest(
                 func.coalesce(Customer.last_activity_at, value), value
-            )
+            ),
+            updated_at=Customer.updated_at,
         )
     )

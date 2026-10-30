@@ -7,7 +7,7 @@
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
 from app.modules.activities.models import ACTIVITY_TYPES, Activity
@@ -26,6 +26,8 @@ from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
 from app.modules.followups.models import FollowUp
+from app.modules.opportunities.schemas import OpportunityCreate
+from app.modules.opportunities.service import create_opportunity
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
 
@@ -464,3 +466,136 @@ def test_admin_can_delete_any_activity(db):
     f = _setup(db)
     activity = _insert(db, f["sb"], f["cust_b"])
     delete_activity(db, f["admin"], activity.id)
+
+
+# --- 写路径不得污染客户行 / 拒 naive 时间 / 归属与软删（评审修复轮）--------
+
+
+def test_creating_activity_does_not_touch_customer_updated_at(db):
+    """写跟进只推进 ``last_activity_at``，不能把「最后修改时间」改成「最后跟进时间」。
+
+    ``TimestampMixin`` 的列级 ``onupdate`` 会给任何 UPDATE 加 ``updated_at=now()``；
+    不 pin 住的话，客户列表按 ``updated_at`` 排序/审计的语义会被跟进写入带偏，而且
+    补录更早的跟进这种"空转写入"也会刷新它。
+    """
+    f = _setup(db)
+    fixed = datetime(2026, 1, 1, tzinfo=UTC)
+    db.execute(
+        update(Customer)
+        .where(Customer.id == f["cust_a"].id)
+        .values(updated_at=fixed)
+    )
+    db.commit()
+
+    _insert(db, f["sa"], f["cust_a"], activity_at=NOW)
+
+    db.expire_all()
+    customer = db.get(Customer, f["cust_a"].id)
+    assert customer.updated_at == fixed
+    assert customer.last_activity_at == NOW
+
+
+def test_delete_activity_never_touches_last_activity_at(db):
+    """裁定 8 的另一半：删除跟进也不推进 ``last_activity_at``（只有创建会）。"""
+    f = _setup(db)
+    activity = _insert(db, f["sa"], f["cust_a"], activity_at=NOW - timedelta(days=10))
+
+    delete_activity(db, f["sa"], activity.id)
+
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at == NOW - timedelta(days=10)
+
+
+def test_create_activity_rejects_opportunity_from_another_customer(db):
+    """``validate_child_links`` 的机会分支：跨客户挂机会必须 400（不是静默接受）。"""
+    f = _setup(db)
+    foreign = create_opportunity(
+        db, f["sb"], OpportunityCreate(customer_id=f["cust_b"].id, name="乙公司机会")
+    )
+    with pytest.raises(InvalidValueError) as exc:
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(
+                customer_id=f["cust_a"].id, content="沟通", opportunity_id=foreign.id
+            ),
+        )
+    assert "机会" in str(exc.value)
+
+
+def test_child_links_soft_deleted_is_not_found(db):
+    """软删的联系人/机会对外不存在：挂到跟进上是 404（与"已删客户 404"同口径）。"""
+    f = _setup(db)
+    contact = create_contact(
+        db, f["sa"], f["cust_a"].id, ContactCreate(name="已删联系人")
+    )
+    contact.deleted_at = datetime.now(UTC)
+    opportunity = create_opportunity(
+        db, f["sa"], OpportunityCreate(customer_id=f["cust_a"].id, name="已删机会")
+    )
+    opportunity.deleted_at = datetime.now(UTC)
+    db.commit()
+
+    with pytest.raises(NotFoundError):
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(
+                customer_id=f["cust_a"].id, content="沟通", contact_id=contact.id
+            ),
+        )
+    with pytest.raises(NotFoundError):
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(
+                customer_id=f["cust_a"].id,
+                content="沟通",
+                opportunity_id=opportunity.id,
+            ),
+        )
+
+
+def test_update_activity_rejects_empty_type(db):
+    """写侧严格：PATCH 传空串同样是非法枚举（400），不能被"空串=不筛选"的宽松语义污染。"""
+    f = _setup(db)
+    activity = _insert(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(InvalidValueError):
+        update_activity(db, f["sa"], activity.id, ActivityUpdate(type=""))
+
+
+def test_create_activity_rejects_naive_activity_at(db):
+    """naive 时间会被 DB session 时区静默解释（换环境偏 8 小时），必须 400。"""
+    f = _setup(db)
+    with pytest.raises(InvalidValueError) as exc:
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(
+                customer_id=f["cust_a"].id,
+                content="沟通",
+                activity_at=datetime(2026, 10, 31, 1, 0),
+            ),
+        )
+    assert "时区" in str(exc.value)
+
+
+def test_next_follow_up_rejects_naive_due_at(db):
+    """「下次跟进」的 ``due_at`` 同样必须带时区：待办逾期判定全靠这个时间。"""
+    f = _setup(db)
+    with pytest.raises(InvalidValueError) as exc:
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(
+                customer_id=f["cust_a"].id,
+                content="沟通",
+                activity_at=NOW,
+                next_follow_up={
+                    "due_at": datetime(2026, 11, 3, 1, 0),
+                    "content": "回访",
+                },
+            ),
+        )
+    assert "时区" in str(exc.value)
