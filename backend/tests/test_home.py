@@ -207,6 +207,52 @@ def test_days_since_local_uses_shanghai_days():
     assert days_since_local(moment, now=NOW) == 2  # 上海 10-29 → 10-31
 
 
+def test_days_since_local_uses_day_diff():
+    """23 小时也能跨一天：按 24 小时整除会得到 0，按自然日必须是 1。
+
+    「昨天 23:00 建的，今天 22:00 看」只差 23 小时，但业务上确实过了一天——
+    首页显示"今天/逾期"、公海显示"已 N 天没跟进"，都用自然日口径。
+    """
+    last = datetime(2026, 10, 30, 23, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    now = datetime(2026, 10, 31, 22, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    assert (now - last).days == 0  # 24 小时口径：不足一天
+    assert days_since_local(last, now=now) == 1  # 自然日口径：跨了一天
+
+
+def test_day_bounds_are_half_open(db):
+    """`[今天 00:00, 明天 00:00)`：左闭右开，边界各归一边、且没有重叠。"""
+    f = _setup(db)
+    today_start = datetime(2026, 10, 31, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    tomorrow_start = today_start + timedelta(days=1)
+    at_midnight = _todo(db, f["sa"], f["cust_a"], due_at=today_start, content="零点")
+    next_midnight = _todo(
+        db, f["sa"], f["cust_a"], due_at=tomorrow_start, content="明天零点"
+    )
+
+    result = summary(db, f["sa"], now=NOW)
+
+    # 今天 00:00 属于今天（左端闭）
+    assert at_midnight.id in [item.id for item in result.today]
+    # 明天 00:00 不属于今天，也不该被算成逾期（右端开）
+    assert next_midnight.id not in [item.id for item in result.today]
+    assert next_midnight.id not in [item.id for item in result.overdue]
+
+
+def test_home_block_limit_truncates(db):
+    """块上限只截 items，`total` 仍是真实条数（否则页面会显示"最多 50 条"）。"""
+    from app.modules.home.service import HOME_BLOCK_LIMIT
+
+    f = _setup(db)
+    for index in range(HOME_BLOCK_LIMIT + 1):
+        _todo(db, f["sa"], f["cust_a"], due_at=NOW, content=f"待办 {index}")
+
+    result = summary(db, f["sa"], now=NOW)
+
+    assert len(result.today) == HOME_BLOCK_LIMIT == 50
+    assert result.today_total == HOME_BLOCK_LIMIT + 1 == 51
+
+
 def test_home_api_shape(client, db):
     f = _setup(db)
     _todo(db, f["sa"], f["cust_a"], due_at=NOW, content="今天的待办")

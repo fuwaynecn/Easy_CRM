@@ -91,6 +91,12 @@ def _pool_notice(
     db: Session, actor: User, *, now: datetime
 ) -> tuple[list[Customer], int]:
     threshold = now - timedelta(days=NOTICE_THRESHOLD_DAYS)
+    # 判定与展示是两把尺子，别互相反推：
+    # - **判定**按瞬时阈值 `last_activity_at < now - 27×24h`（spec §4.2 原文的
+    #   `now() - (...)`，是时间戳比较）；
+    # - **展示**的 `days_inactive` 按上海自然日（`days_since_local`），前端只负责显示。
+    # 因此边界上会出现"显示 27 天但还没进预警"（差几分钟到 27×24 小时）。P4 做回收
+    # 任务时也必须用瞬时阈值，不能拿展示天数 >= 27 反推。
 
     # 两条豁免（spec §4.1/§4.2）：有未关闭机会、有 pending 待办
     open_deal_exists = (
