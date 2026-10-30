@@ -4,7 +4,7 @@
 （列表 / 单条 / 不存在 / 已删）上是否成立，而不是再造一套作用域。
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -182,3 +182,62 @@ def test_list_orders_by_activity_at_descending(db):
     items, _ = list_activities(db, f["sa"])
 
     assert [item.id for item in items] == [newer.id, older.id]
+
+
+def test_get_soft_deleted_activity_is_404_not_403(db):
+    """已删跟进对外表现为不存在：自己的删了是 404，别部门的删了也不能变成 403。
+
+    403 会泄漏"这条 id 曾经存在"。已删记录的唯一语义是不认识它，因此存在性探针
+    必须带 ``deleted_at IS NULL``——少了它，别部门已删的记录会先撞作用域给出 403。
+    """
+    f = _setup(db)
+    mine = _insert(db, f["sa"], f["cust_a"])
+    mine.deleted_at = datetime.now(UTC)
+    foreign = _insert(db, f["sb"], f["cust_b"])
+    foreign.deleted_at = datetime.now(UTC)
+    db.commit()
+
+    with pytest.raises(NotFoundError):
+        get_activity(db, f["sa"], mine.id)
+    # 别部门 + 已删：作用域与软删同时命中时，404 必须优先于 403
+    with pytest.raises(NotFoundError):
+        get_activity(db, f["sa"], foreign.id)
+
+
+def test_list_rejects_inverted_date_range(db):
+    """``date_from > date_to`` 是参数错误（400），不是空列表：空列表会被读成"没有跟进"。"""
+    f = _setup(db)
+    with pytest.raises(InvalidValueError):
+        list_activities(
+            db, f["sa"], date_from=date(2026, 10, 31), date_to=date(2026, 10, 1)
+        )
+
+
+def test_same_instant_orders_by_id_desc_and_pages_stably(db):
+    """同一时刻的三条按 id 倒序；page_size=2 翻两页不重不漏。
+
+    第二排序键 ``id desc`` 与 offset 分页是一对：只按 ``activity_at`` 排时，
+    同一时刻的记录顺序由数据库自由决定，翻页会漏行或重行。
+    """
+    f = _setup(db)
+    first = _insert(db, f["sa"], f["cust_a"], content="一", activity_at=NOW)
+    second = _insert(db, f["sa"], f["cust_a"], content="二", activity_at=NOW)
+    third = _insert(db, f["sa"], f["cust_a"], content="三", activity_at=NOW)
+
+    page1, total1 = list_activities(db, f["sa"], page=1, page_size=2)
+    page2, total2 = list_activities(db, f["sa"], page=2, page_size=2)
+
+    assert (total1, total2) == (3, 3)
+    assert [item.id for item in page1] == [third.id, second.id]
+    assert [item.id for item in page2] == [first.id]
+
+
+def test_same_department_colleague_activity_is_visible(db):
+    """可见性随客户、不随作者：同部门同事在"我的客户"上写的跟进，我看得见。"""
+    f = _setup(db)
+    colleague = _insert(db, f["sc"], f["cust_a"], content="同事替我打的电话")
+
+    items, total = list_activities(db, f["sa"])
+
+    assert total == 1
+    assert [item.id for item in items] == [colleague.id]
