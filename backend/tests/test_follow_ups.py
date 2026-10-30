@@ -8,13 +8,29 @@ spec §3.9 的关键结论：**待办不设负责人字段**，它跟着客户�
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
+from sqlalchemy import func, select
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
+from app.modules.activities.models import Activity
+from app.modules.activities.schemas import ActivityCreate
+from app.modules.activities.service import create_activity
+from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
 from app.modules.followups.models import FOLLOW_UP_STATUSES, FollowUp
-from app.modules.followups.service import get_follow_up, list_follow_ups
+from app.modules.followups.schemas import FollowUpCreate, FollowUpDone, FollowUpUpdate
+from app.modules.followups.service import (
+    complete_follow_up,
+    create_follow_up,
+    delete_follow_up,
+    get_follow_up,
+    list_follow_ups,
+    update_follow_up,
+)
+from app.modules.opportunities.schemas import OpportunityCreate
+from app.modules.opportunities.service import create_opportunity
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
 
@@ -49,22 +65,24 @@ def _setup(db):
         "admin": admin, "boss": boss, "sa": sa, "sc": sc, "sb": sb,
         "cust_a": create_customer(db, sa, CustomerCreate(name="甲制造有限公司")),
         "cust_b": create_customer(db, sb, CustomerCreate(name="乙制造有限公司")),
+        "cust_pool": create_customer(db, admin, CustomerCreate(name="丙制造有限公司")),
     }
 
 
 def _insert(db, actor, customer, *, content="下周回访", due_at=None, status="pending"):
-    """读侧测试的最小造数（写接口在 Task 5；届时本 helper 换成 create_follow_up）。"""
-    row = FollowUp(
-        customer_id=customer.id,
-        due_at=due_at or NOW,
-        content=content,
-        status=status,
-        done_at=datetime.now(UTC) if status == "done" else None,
-        created_by=actor.id,
+    """造数走真实写接口；`status` 仅用于构造已完成/已取消的读侧场景。"""
+    row = create_follow_up(
+        db,
+        actor,
+        FollowUpCreate(
+            customer_id=customer.id, due_at=due_at or NOW, content=content
+        ),
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+    if status != "pending":
+        # 只改既有列，不模拟任何未实现的接口
+        row.status = status
+        row.done_at = datetime.now(UTC) if status == "done" else None
+        db.commit()
     return row
 
 
@@ -125,7 +143,8 @@ def test_list_filters_by_status_and_customer(db):
     f = _setup(db)
     pending = _insert(db, f["sa"], f["cust_a"], content="待办")
     _insert(db, f["sa"], f["cust_a"], content="已完成", status="done")
-    other = _insert(db, f["sc"], f["cust_a"], content="同事的待办")
+    # 真实写路径下销售写不了同事的客户，能写他人客户的只有本部门主管
+    other = _insert(db, f["boss"], f["cust_a"], content="主管的待办")
 
     pending_items, pending_total = list_follow_ups(db, f["boss"], status="pending")
     assert pending_total == 2
@@ -246,13 +265,13 @@ def test_same_due_at_orders_by_id_and_pages_stably(db):
 def test_mine_combines_with_status_filter(db):
     """`mine` 与 `status` 是 AND 叠加，不是互相覆盖。
 
-    两条待办都写在销售 A 的客户上，但由**同部门同事**创建：因此本用例同时钉住
+    两条待办都写在销售 A 的客户上，但由**同部门主管**创建：因此本用例同时钉住
     「我的待办按客户负责人、不按创建人」——若 mine 改成 ``created_by == me``，
     这里一条都查不到。
     """
     f = _setup(db)
-    pending = _insert(db, f["sc"], f["cust_a"], content="待办")
-    done = _insert(db, f["sc"], f["cust_a"], content="已完成", status="done")
+    pending = _insert(db, f["boss"], f["cust_a"], content="待办")
+    done = _insert(db, f["boss"], f["cust_a"], content="已完成", status="done")
 
     done_items, done_total = list_follow_ups(db, f["sa"], mine=True, status="done")
     assert done_total == 1
@@ -272,3 +291,247 @@ def test_empty_status_filter_means_no_filter(db):
 
     assert total == 1
     assert len(items) == 1
+
+
+def test_create_follow_up_keeps_last_activity_at_untouched(db):
+    """建待办不是 §3.3 的同步点：不能让"安排了下周回访"把客户变新鲜。"""
+    f = _setup(db)
+    create_follow_up(
+        db,
+        f["sa"],
+        FollowUpCreate(
+            customer_id=f["cust_a"].id,
+            due_at=NOW + timedelta(days=3),
+            content="下周回访",
+        ),
+    )
+
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at is None
+
+
+def test_create_follow_up_on_pool_customer_is_403(db):
+    f = _setup(db)
+    with pytest.raises(ForbiddenError) as exc:
+        create_follow_up(
+            db,
+            f["sa"],
+            FollowUpCreate(customer_id=f["cust_pool"].id, due_at=NOW, content="回访"),
+        )
+    assert "公海" in str(exc.value)
+
+
+def test_create_follow_up_rejects_opportunity_from_another_customer(db):
+    f = _setup(db)
+    opportunity = create_opportunity(
+        db, f["sb"], OpportunityCreate(customer_id=f["cust_b"].id, name="乙公司机会")
+    )
+    with pytest.raises(InvalidValueError):
+        create_follow_up(
+            db,
+            f["sa"],
+            FollowUpCreate(
+                customer_id=f["cust_a"].id, due_at=NOW, content="回访",
+                opportunity_id=opportunity.id,
+            ),
+        )
+
+
+def test_create_follow_up_rejects_naive_or_missing_due_at(db):
+    """``due_at`` 必须带时区、且不能为空：两者都是 400，不是 500。
+
+    naive 时间会被 session 时区静默解释（待办逾期判定全靠它）；``None`` 若放行会在
+    flush 时撞 NOT NULL 变成 500。``model_construct`` 模拟绕过 schema 的调用方。
+    """
+    f = _setup(db)
+    with pytest.raises(InvalidValueError) as exc:
+        create_follow_up(
+            db,
+            f["sa"],
+            FollowUpCreate(
+                customer_id=f["cust_a"].id,
+                due_at=datetime(2026, 11, 3, 1, 0),
+                content="回访",
+            ),
+        )
+    assert "时区" in str(exc.value)
+
+    bypassed = FollowUpCreate.model_construct(
+        customer_id=f["cust_a"].id,
+        contact_id=None,
+        opportunity_id=None,
+        due_at=None,
+        content="回访",
+    )
+    with pytest.raises(InvalidValueError) as exc:
+        create_follow_up(db, f["sa"], bypassed)
+    assert "不能为空" in str(exc.value)
+
+
+def test_patch_cannot_change_customer(db):
+    """待办跟客户走：PATCH 带 customer_id 是 422（schema extra=forbid）。"""
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+    with pytest.raises(ValidationError):
+        FollowUpUpdate(customer_id=f["cust_b"].id, content="换客户")
+    assert todo.id is not None
+
+
+def test_patch_status_done_is_rejected(db):
+    """裁定 10：完成只能走 /done，PATCH 传 done 是 400 而不是默默完成。"""
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+    with pytest.raises(InvalidValueError):
+        update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(status="done"))
+
+
+def test_patch_cancelled_then_reopen(db):
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+
+    cancelled = update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(status="cancelled"))
+    assert cancelled.status == "cancelled"
+    assert cancelled.done_at is None
+
+    reopened = update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(status="pending"))
+    assert reopened.status == "pending"
+
+
+def test_completed_follow_up_cannot_change_status(db):
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+    complete_follow_up(db, f["sa"], todo.id, FollowUpDone())
+
+    with pytest.raises(InvalidValueError):
+        update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(status="pending"))
+
+
+def test_complete_sets_status_and_done_at(db):
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+
+    result = complete_follow_up(db, f["sa"], todo.id, FollowUpDone())
+
+    assert result.follow_up.status == "done"
+    assert result.follow_up.done_at is not None
+    assert result.activity is None
+    # 不勾选"顺便写跟进"时不能刷新客户新鲜度
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at is None
+
+
+def test_complete_twice_is_400(db):
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+    complete_follow_up(db, f["sa"], todo.id, FollowUpDone())
+
+    with pytest.raises(InvalidValueError):
+        complete_follow_up(db, f["sa"], todo.id, FollowUpDone())
+
+
+def test_complete_with_activity_copies_content_and_bumps_last_activity(db):
+    """spec §4.5：勾选"顺便写条跟进"→ 复制待办内容成 activity，并刷新 last_activity_at。"""
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"], content="把样册送到现场")
+
+    result = complete_follow_up(
+        db, f["sa"], todo.id, FollowUpDone(create_activity=True, activity_type="visit")
+    )
+
+    assert result.activity is not None
+    activity = db.get(Activity, result.activity.id)
+    assert activity.content == "把样册送到现场"
+    assert activity.type == "visit"
+    assert activity.customer_id == f["cust_a"].id
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at is not None
+
+
+def test_complete_without_ticking_but_passing_type_is_400(db):
+    """不勾选却指定跟进方式是调用方意图矛盾，静默忽略会让用户以为记下了。
+
+    而且必须**先校验再写库**：异常后待办状态与跟进行都不能有变化。
+    """
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(InvalidValueError):
+        complete_follow_up(
+            db, f["sa"], todo.id, FollowUpDone(create_activity=False, activity_type="call")
+        )
+
+    db.expire_all()
+    row = db.get(FollowUp, todo.id)
+    assert row.status == "pending"
+    assert row.done_at is None
+    assert db.execute(select(func.count()).select_from(Activity)).scalar_one() == 0
+
+
+def test_manager_can_edit_todo_on_subordinate_customer(db):
+    """裁定 9：待办的「本人」= 客户当前负责人；主管建的待办，下属照样能改。"""
+    f = _setup(db)
+    todo = _insert(db, f["boss"], f["cust_a"], content="主管安排的回访")
+
+    updated = update_follow_up(db, f["sa"], todo.id, FollowUpUpdate(content="销售A改期"))
+
+    assert updated.content == "销售A改期"
+
+
+def test_colleague_cannot_edit_or_delete_todo(db):
+    f = _setup(db)
+    # cust_a 属于销售 A；销售 C 同部门但既不是负责人也不是创建者
+    todo = _insert(db, f["sa"], f["cust_a"])
+
+    with pytest.raises(ForbiddenError):
+        update_follow_up(db, f["sc"], todo.id, FollowUpUpdate(content="我改"))
+    with pytest.raises(ForbiddenError):
+        delete_follow_up(db, f["sc"], todo.id)
+
+
+def test_manager_can_delete_department_todo_but_not_edit(db):
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"], content="销售自己的待办")
+
+    with pytest.raises(ForbiddenError):
+        update_follow_up(db, f["boss"], todo.id, FollowUpUpdate(content="主管改"))
+
+    delete_follow_up(db, f["boss"], todo.id)
+    db.expire_all()
+    assert db.get(FollowUp, todo.id).deleted_at is not None
+
+
+def test_delete_follow_up_is_soft_and_repeat_is_404(db):
+    f = _setup(db)
+    todo = _insert(db, f["sa"], f["cust_a"])
+
+    delete_follow_up(db, f["sa"], todo.id)
+    with pytest.raises(NotFoundError):
+        delete_follow_up(db, f["sa"], todo.id)
+
+
+def test_failed_next_follow_up_rolls_back_everything(db):
+    """异常路径整体回滚：跟进已 flush、客户时间已推进，但待办建失败 → 三者都不留。
+
+    ``next_follow_up.content`` 全空白能通过 schema 的 ``min_length=1``，在待办原语里
+    才被 ``_clean_content`` 拒掉；此时 activity 已经 flush、last_activity_at 的 UPDATE
+    也已发出，只有事务回滚才能保证"要么都成、要么都不成"。
+    """
+    f = _setup(db)
+    with pytest.raises(InvalidValueError):
+        create_activity(
+            db,
+            f["sa"],
+            ActivityCreate(
+                customer_id=f["cust_a"].id,
+                content="这条跟进不该留下",
+                activity_at=NOW,
+                next_follow_up={"due_at": NOW + timedelta(days=1), "content": "   "},
+            ),
+        )
+
+    db.rollback()
+
+    assert db.execute(select(func.count()).select_from(Activity)).scalar_one() == 0
+    assert db.execute(select(func.count()).select_from(FollowUp)).scalar_one() == 0
+    db.expire_all()
+    assert db.get(Customer, f["cust_a"].id).last_activity_at is None

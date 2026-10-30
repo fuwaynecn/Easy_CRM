@@ -6,18 +6,30 @@
 **不是**按 ``follow_ups.created_by``——后者会让接手人看不到前任留下的待办。
 """
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
 from app.core.timeutil import ensure_aware
-from app.db.scope import customer_query
+from app.db.scope import assert_customer_writable, customer_query
+from app.modules.activities.models import Activity
+from app.modules.activities.service import (
+    create_activity_record,
+    validate_activity_type,
+)
+from app.modules.customers.links import validate_child_links
 from app.modules.customers.models import Customer
 from app.modules.customers.service import get_customer
 from app.modules.followups.models import FOLLOW_UP_STATUSES, FollowUp
-from app.modules.users.models import User
+from app.modules.followups.schemas import (
+    FollowUpCreate,
+    FollowUpDone,
+    FollowUpUpdate,
+)
+from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, User
 
 
 def _clean_content(content: str | None) -> str:
@@ -133,3 +145,180 @@ def list_follow_ups(
     stmt = _with_relations(stmt).order_by(FollowUp.due_at.asc(), FollowUp.id.asc())
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
     return list(db.execute(stmt).scalars().all()), int(total)
+
+
+@dataclass(frozen=True)
+class Completion:
+    """完成待办的结果：待办自身 + 可选的随附跟进。"""
+
+    follow_up: FollowUp
+    activity: Activity | None
+
+
+def _load_full(db: Session, follow_up_id: int) -> FollowUp:
+    """写完回读：`customer` / `operator` 都是 lazy="raise"。"""
+    return db.execute(
+        _with_relations(select(FollowUp))
+        .where(FollowUp.id == follow_up_id)
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+
+def _assert_can_edit_follow_up(
+    follow_up: FollowUp, actor: User, customer: Customer
+) -> None:
+    """裁定 5 + 9：本人（创建者或客户当前负责人）与管理员可改。
+
+    「创建者」也放行是刻意的：主管替下属客户建的待办，建完就该能改期；但主管
+    **不能**改别人建的待办——那种情况只有客户负责人和管理员能改（见裁定 9）。
+    """
+    if (
+        actor.role == ROLE_ADMIN
+        or follow_up.created_by == actor.id
+        or customer.owner_id == actor.id
+    ):
+        return
+    raise ForbiddenError("只能修改自己或自己客户名下的待办")
+
+
+def _assert_can_delete_follow_up(
+    follow_up: FollowUp, actor: User, customer: Customer
+) -> None:
+    """裁定 5：本人可删；主管可删本部门；管理员全部。"""
+    if (
+        actor.role == ROLE_MANAGER
+        and actor.department_id is not None
+        and customer.department_id == actor.department_id
+    ):
+        return
+    _assert_can_edit_follow_up(follow_up, actor, customer)
+
+
+def create_follow_up(
+    db: Session, actor: User, payload: FollowUpCreate
+) -> FollowUp:
+    """建待办：可见客户且可写（公海只读）才允许；建待办不推进 ``last_activity_at``。"""
+    # 先校验时间再碰库：naive 会被 session 时区静默解释，None 会撞 NOT NULL 变 500
+    due_at = ensure_aware(payload.due_at, "待办到期时间")
+    if due_at is None:
+        raise InvalidValueError("待办到期时间不能为空")
+
+    customer = get_customer(db, actor, payload.customer_id)
+    assert_customer_writable(customer, actor)
+    validate_child_links(
+        db,
+        customer_id=customer.id,
+        contact_id=payload.contact_id,
+        opportunity_id=payload.opportunity_id,
+    )
+    follow_up = create_pending_follow_up_in_tx(
+        db,
+        customer_id=customer.id,
+        contact_id=payload.contact_id,
+        opportunity_id=payload.opportunity_id,
+        due_at=due_at,
+        content=payload.content,
+        created_by=actor.id,
+    )
+    db.commit()
+    return _load_full(db, follow_up.id)
+
+
+def update_follow_up(
+    db: Session, actor: User, follow_up_id: int, payload: FollowUpUpdate
+) -> FollowUp:
+    """编辑待办：改内容/到期时间，或在 pending ↔ cancelled 之间切换。
+
+    所有校验都在 ``setattr`` 之前完成：``status="done"`` 或任何非法迁移直接 400，
+    不会出现"改了一半再抛"的半写状态。
+    """
+    follow_up = get_follow_up(db, actor, follow_up_id)
+    customer = get_customer(db, actor, follow_up.customer_id)
+    assert_customer_writable(customer, actor)
+    _assert_can_edit_follow_up(follow_up, actor, customer)
+
+    changes = payload.model_dump(exclude_unset=True)
+    if "status" in changes:
+        status = changes["status"]
+        if status is None:
+            raise InvalidValueError("待办状态不能为空")
+        if status == "done":
+            raise InvalidValueError("标记完成请使用 POST /follow_ups/{id}/done")
+        if status not in ("pending", "cancelled"):
+            raise InvalidValueError(f"未知待办状态：{status}")
+        if follow_up.status == "done":
+            raise InvalidValueError("已完成的待办不能再改状态")
+    if "due_at" in changes and changes["due_at"] is None:
+        raise InvalidValueError("到期时间不能为空")
+    if "due_at" in changes:
+        changes["due_at"] = ensure_aware(changes["due_at"], "待办到期时间")
+    if "content" in changes:
+        changes["content"] = _clean_content(changes["content"])
+    for field, value in changes.items():
+        setattr(follow_up, field, value)
+    db.commit()
+    return _load_full(db, follow_up.id)
+
+
+def complete_follow_up(
+    db: Session, actor: User, follow_up_id: int, payload: FollowUpDone
+) -> Completion:
+    """完成待办；可选在同一事务里写一条跟进并刷新 last_activity_at（spec §4.5）。
+
+    三件事一起成/一起不成：待办置 done、可选的跟进记录、``last_activity_at``。
+    校验全部在写入之前：已完成的不能再完成、已取消的不能完成、不勾选却指定跟进
+    方式一律 400。
+    """
+    follow_up = get_follow_up(db, actor, follow_up_id)
+    customer = get_customer(db, actor, follow_up.customer_id)
+    assert_customer_writable(customer, actor)
+
+    if follow_up.status == "done":
+        raise InvalidValueError("该待办已完成")
+    if follow_up.status == "cancelled":
+        raise InvalidValueError("该待办已取消，不能标记完成")
+    if "activity_type" in payload.model_fields_set and not payload.create_activity:
+        raise InvalidValueError("未勾选写跟进时不需要指定跟进方式")
+    if payload.create_activity:
+        validate_activity_type(payload.activity_type)
+
+    now = datetime.now(UTC)
+    follow_up.status = "done"
+    follow_up.done_at = now
+
+    activity: Activity | None = None
+    if payload.create_activity:
+        activity = create_activity_record(
+            db,
+            customer_id=follow_up.customer_id,
+            contact_id=follow_up.contact_id,
+            opportunity_id=follow_up.opportunity_id,
+            type=payload.activity_type,
+            content=follow_up.content,
+            activity_at=now,
+            operator_id=actor.id,
+        )
+
+    db.commit()
+    return Completion(
+        follow_up=_load_full(db, follow_up.id),
+        activity=(
+            db.execute(
+                select(Activity).options(joinedload(Activity.operator)).where(
+                    Activity.id == activity.id
+                ).execution_options(populate_existing=True)
+            ).scalar_one()
+            if activity is not None
+            else None
+        ),
+    )
+
+
+def delete_follow_up(db: Session, actor: User, follow_up_id: int) -> None:
+    """软删：误建才用它；「不做了」用 status='cancelled'（留痕），两者语义不同。"""
+    follow_up = get_follow_up(db, actor, follow_up_id)
+    customer = get_customer(db, actor, follow_up.customer_id)
+    assert_customer_writable(customer, actor)
+    _assert_can_delete_follow_up(follow_up, actor, customer)
+    follow_up.deleted_at = datetime.now(UTC)
+    db.commit()
