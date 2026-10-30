@@ -7,6 +7,7 @@ import { RequireAuth } from "./auth/RequireAuth";
 import { AppShell } from "./components/AppShell";
 import CustomerDetailPage from "./pages/CustomerDetailPage";
 import CustomerListPage from "./pages/CustomerListPage";
+import HomePage from "./pages/HomePage";
 import LoginPage from "./pages/LoginPage";
 import OpportunityBoardPage from "./pages/OpportunityBoardPage";
 import OpportunityListPage from "./pages/OpportunityListPage";
@@ -31,7 +32,19 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
-            <Route path="/" element={<Navigate to="/customers" replace />} />
+            <Route
+              path="/"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <HomePage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            {/* `/` 已经是真实首页，不再把它重定向到客户列表；`/home` 留个别名，
+                避免旧书签/外部链接落到 404 兜底。 */}
+            <Route path="/home" element={<Navigate to="/" replace />} />
             <Route
               path="/customers"
               element={
