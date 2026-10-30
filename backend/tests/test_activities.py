@@ -241,3 +241,18 @@ def test_same_department_colleague_activity_is_visible(db):
 
     assert total == 1
     assert [item.id for item in items] == [colleague.id]
+
+
+def test_empty_type_filter_means_no_filter(db):
+    """筛选参数的空串 = 不筛选（与 ``follow_ups`` 的 ``status`` 同一语义）。
+
+    前端清空下拉会带 ``?type=``；若这里 400，同一套前端就要为两个同类参数写两种
+    处理。写入路径的严格校验不受影响（Task 4 义务，见 service.list_activities 注释）。
+    """
+    f = _setup(db)
+    _insert(db, f["sa"], f["cust_a"], type="call")
+
+    items, total = list_activities(db, f["sa"], type="")
+
+    assert total == 1
+    assert len(items) == 1

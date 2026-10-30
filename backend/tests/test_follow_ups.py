@@ -261,3 +261,14 @@ def test_mine_combines_with_status_filter(db):
     all_items, all_total = list_follow_ups(db, f["sa"], mine=True)
     assert all_total == 2
     assert {item.id for item in all_items} == {pending.id, done.id}
+
+
+def test_empty_status_filter_means_no_filter(db):
+    """空串 = 不筛选：与 ``activities`` 的 ``type`` 筛选同一语义（见同名用例）。"""
+    f = _setup(db)
+    _insert(db, f["sa"], f["cust_a"])
+
+    items, total = list_follow_ups(db, f["sa"], status="")
+
+    assert total == 1
+    assert len(items) == 1

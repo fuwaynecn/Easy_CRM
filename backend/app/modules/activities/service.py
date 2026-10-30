@@ -77,8 +77,16 @@ def list_activities(
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[list[Activity], int]:
-    """作用域内的跟进分页，按 `activity_at` 倒序（第二键 id 倒序，翻页稳定）。"""
-    _validate_type(type)
+    """作用域内的跟进分页，按 `activity_at` 倒序（第二键 id 倒序，翻页稳定）。
+
+    筛选参数的空串按"不筛选"处理（前端清空下拉会带 `?type=`），与
+    `followups.list_follow_ups` 的 `status` 保持同一语义。**写入路径仍然严格**：
+    Task 4 的 create/update 传 `type=""` 必须 400（`_validate_type` 不加 `if`），
+    否则空串会以非法枚举落库、只剩数据库 CHECK 兜底。
+    """
+    # 只有非空取值才校验：空串 = 不筛选，非法值（如 "telepathy"）仍是 400
+    if type:
+        _validate_type(type)
     if date_from is not None and date_to is not None and date_from > date_to:
         raise InvalidValueError("开始日期不能晚于结束日期")
     if customer_id is not None:

@@ -50,6 +50,14 @@ CHECK_CONSTRAINT_NAMES = {
     },
 }
 
+# CHECK 的**表达式**：``compare_metadata`` 不比 CHECK，名字断言只挡"被删/改名"。
+# 模型侧枚举改了、迁移还是旧值时，名字照样在，只有 pg_get_constraintdef 能发现。
+CHECK_CONSTRAINT_DEFINITIONS = {
+    "ck_activities_type": ("call", "visit", "wechat", "email", "note", "other"),
+    "ck_follow_ups_status": ("pending", "done", "cancelled"),
+    "ck_follow_ups_done_at_consistency": ("done", "done_at IS NOT NULL"),
+}
+
 
 def _render(diff: list[object]) -> str:
     return "\n".join(f"  - {item}" for item in diff)
@@ -114,6 +122,21 @@ def test_migrated_schema_keeps_named_checks_and_column_defaults(engine: Engine) 
                 )
             }
             assert wanted <= names, f"{table_name} 缺少 CHECK 约束：{wanted - names}"
+
+        # CHECK 表达式（pg_get_constraintdef）：名字在、表达式过时（模型枚举改了、
+        # 迁移没跟上）也必须红——否则线上约束会放行新枚举旧值。
+        for name, fragments in CHECK_CONSTRAINT_DEFINITIONS.items():
+            definition = connection.execute(
+                text(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                    "WHERE conname = :name"
+                ),
+                {"name": name},
+            ).scalar_one()
+            for fragment in fragments:
+                assert fragment in definition, (
+                    f"{name} 的表达式缺少 {fragment}：{definition}"
+                )
 
         # 裸 INSERT 只给必填列：默认值若没进迁移产物，这里撞的是 NOT NULL，
         # 不是"断言失败"——两种都红，正是这条用例要的。
