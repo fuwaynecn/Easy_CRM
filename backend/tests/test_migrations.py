@@ -33,6 +33,10 @@ CHECK_CONSTRAINT_NAMES = {
     "activities": {
         "ck_activities_type",
     },
+    "follow_ups": {
+        "ck_follow_ups_status",
+        "ck_follow_ups_done_at_consistency",
+    },
     "opportunities": {
         "ck_opportunities_stage",
         "ck_opportunities_win_rate_range",
@@ -154,11 +158,32 @@ def test_migrated_schema_keeps_named_checks_and_column_defaults(engine: Engine) 
             {"customer_id": customer_id, "owner_id": owner_id},
         ).scalar_one()
         assert activity_at is not None
-        with pytest.raises(IntegrityError):
+        # 违规插入放进 SAVEPOINT：CHECK 失败会中止当前事务，若不回退保存点，后面的
+        # 探针会全部撞 "current transaction is aborted"（Task 3 追加待办探针时暴露）。
+        with pytest.raises(IntegrityError), connection.begin_nested():
             connection.execute(
                 text(
                     "INSERT INTO activities (customer_id, type, content, activity_at, created_by) "
                     "VALUES (:customer_id, 'telepathy', '非法类型', now(), :owner_id)"
+                ),
+                {"customer_id": customer_id, "owner_id": owner_id},
+            )
+
+        # 待办：status 的 server_default 必须落在迁移产物上
+        pending_status = connection.execute(
+            text(
+                "INSERT INTO follow_ups (customer_id, due_at, content, created_by) "
+                "VALUES (:customer_id, now(), '迁移探针待办', :owner_id) RETURNING status"
+            ),
+            {"customer_id": customer_id, "owner_id": owner_id},
+        ).scalar_one()
+        assert pending_status == "pending"
+        # done 却没有 done_at 必须被数据库挡住（同样用 SAVEPOINT 隔离）
+        with pytest.raises(IntegrityError), connection.begin_nested():
+            connection.execute(
+                text(
+                    "INSERT INTO follow_ups (customer_id, due_at, content, created_by, status) "
+                    "VALUES (:customer_id, now(), '非法已完成', :owner_id, 'done')"
                 ),
                 {"customer_id": customer_id, "owner_id": owner_id},
             )
