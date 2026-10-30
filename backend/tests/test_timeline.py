@@ -5,13 +5,13 @@
 而是把它们钉成契约——否则某次顺手加的 `deleted_at IS NULL` 会让历史凭空消失。
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from app.core.errors import ForbiddenError, InvalidValueError, NotFoundError
 from app.modules.activities.schemas import ActivityCreate
-from app.modules.activities.service import create_activity
+from app.modules.activities.service import create_activity, delete_activity
 from app.modules.contacts.schemas import ContactCreate
 from app.modules.contacts.service import create_contact, delete_contact
 from app.modules.customers.schemas import CustomerCreate
@@ -200,6 +200,67 @@ def test_timeline_cursor_roundtrip_and_invalid_cursor(db):
 
     with pytest.raises(InvalidValueError):
         decode_cursor("not-a-cursor")
+
+
+def test_timeline_hides_soft_deleted_activity(db):
+    """裁定 1 的两面：已删**活动**不再出现，已删**机会**的阶段历史仍然出现。
+
+    两者都读同一张时间线，却按相反口径处理——活动是"要不要展示这条记录"，
+    阶段历史是"这笔单曾经发生过什么"。混成一条规则就会二选一丢数据。
+    """
+    f = _setup(db)
+    kept = create_activity(
+        db, f["sa"], ActivityCreate(customer_id=f["cust_a"].id, content="留下", activity_at=NOW)
+    )
+    gone = create_activity(
+        db,
+        f["sa"],
+        ActivityCreate(
+            customer_id=f["cust_a"].id,
+            content="删掉",
+            activity_at=NOW + timedelta(minutes=1),
+        ),
+    )
+    delete_activity(db, f["sa"], gone.id)
+
+    opportunity = create_opportunity(
+        db, f["sa"], OpportunityCreate(customer_id=f["cust_a"].id, name="已删的单")
+    )
+    change_stage(db, f["sa"], opportunity.id, StageChange(stage="proposal"))
+    delete_opportunity(db, f["boss"], opportunity.id)
+
+    entries, _ = get_timeline(db, f["sa"], f["cust_a"].id)
+
+    activity_ids = [entry.id for entry in entries if entry.type == "activity"]
+    assert activity_ids == [kept.id]
+    stage_entries = [entry for entry in entries if entry.type == "stage_change"]
+    assert len(stage_entries) == 2
+    assert all(entry.opportunity_deleted for entry in stage_entries)
+
+
+def test_timeline_rejects_non_positive_limit(db):
+    """`limit=0` 会静默返回空页、`limit=-5` 会撞数据库错误变 500，都是 400 更清楚。
+
+    HTTP 层的 1–50 是 422（参数层）；这里钉的是 service 被内部调用方传坏的情况。
+    """
+    f = _setup(db)
+    for bad_limit in (0, -5):
+        with pytest.raises(InvalidValueError):
+            get_timeline(db, f["sa"], f["cust_a"].id, limit=bad_limit)
+
+
+def test_timeline_cursor_rejects_unimplemented_owner_change_type(db):
+    """`owner_change` 只在枚举里占位（P4 才接入），伪造这种游标必须 400。
+
+    放它过去会让游标条件永远匹配不到，安静地返回空页——比 400 难查得多。
+    """
+    from base64 import urlsafe_b64encode
+
+    raw = f"{NOW.isoformat()}|owner_change|1"
+    forged = urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+    with pytest.raises(InvalidValueError):
+        decode_cursor(forged)
 
 
 def test_timeline_of_invisible_customer_is_403_and_missing_is_404(db):

@@ -3,6 +3,10 @@
 路径挂在 `/customers/{id}/timeline`（spec §5），但实现放在独立模块：客户服务
 import activities/followups 会形成循环（activities.service 已经 import
 customers.service），timeline 只向下依赖，不制造反向边。
+
+错误码口径（全项目一致，拍定于 T6 收尾）：**参数与请求体校验 = 422**（`limit`
+越界、body 白名单由 FastAPI/pydantic 在参数层挡住），**业务规则 = 400**（非法
+游标、service 层收到的非法 limit），**权限 = 403**，**不存在 = 404**。
 """
 
 from typing import Annotated

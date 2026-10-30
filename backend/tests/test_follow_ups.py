@@ -557,6 +557,9 @@ def test_complete_with_blank_content_after_bypass_is_400(db):
             FollowUpDone(create_activity=True, activity_type="visit"),
         )
 
+    # 清洗必须先于"落状态"：若先置 done 再抛，异常路径的会话里会留下脏对象。
+    # 只断言落库结果是抓不到的——不 commit 时数据库本来就没变。
+    assert not db.dirty
     db.expire_all()
     row = db.get(FollowUp, todo.id)
     assert row.status == "pending"

@@ -33,6 +33,10 @@ TIMELINE_TYPES = ("activity", "stage_change", "owner_change")
 ACTIVITY_TIMELINE_TYPE = "activity"
 STAGE_CHANGE_TIMELINE_TYPE = "stage_change"
 
+# 游标只认已实现的两类：伪造一个 owner_change 游标会让分页条件永远匹配不到，
+# 静默返回空页比 400 更难查。P4 接上 owner_change_logs 后再把常量改成 TIMELINE_TYPES。
+CURSOR_TYPES = (ACTIVITY_TIMELINE_TYPE, STAGE_CHANGE_TIMELINE_TYPE)
+
 
 @dataclass(frozen=True)
 class TimelineCursor:
@@ -73,7 +77,7 @@ def decode_cursor(raw: str) -> TimelineCursor:
     try:
         decoded = urlsafe_b64decode(raw.encode("ascii")).decode("utf-8")
         occurred_at_raw, type_raw, id_raw = decoded.split("|")
-        if type_raw not in TIMELINE_TYPES:
+        if type_raw not in CURSOR_TYPES:
             raise ValueError(type_raw)
         occurred_at = datetime.fromisoformat(occurred_at_raw)
         # 伪造的游标可能不带时区：放过去会在 SQL 里变成 naive 比较，500 而不是 400
@@ -254,7 +258,14 @@ def get_timeline(
     cursor: str | None = None,
     limit: int = 20,
 ) -> tuple[list[TimelineEntry], str | None]:
-    """客户可见才返回时间线（403/404 与其它入口同口径）。"""
+    """客户可见才返回时间线（403/404 与其它入口同口径）。
+
+    HTTP 层的范围校验（`limit` 1–50）是 422（参数层，与 `PageParams` 同口径）；
+    到了 service 还传 0/负数说明是内部调用方，给 400：`limit=0` 会静默返回空页、
+    `limit=-5` 会让 `OFFSET` 之前的 `LIMIT -4` 撞数据库错误变成 500。
+    """
+    if limit < 1:
+        raise InvalidValueError("时间线分页大小必须大于 0")
     get_customer(db, actor, customer_id)
     parsed = decode_cursor(cursor) if cursor else None
 
