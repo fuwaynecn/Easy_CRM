@@ -172,6 +172,7 @@ def test_patch_and_delete_activity(client, db):
 
     removed = client.delete(f"/api/v1/activities/{created['id']}", headers=headers)
     assert removed.status_code == 204
+    assert removed.content == b""  # 204 不许带 body（FastAPI 里真会退化出 "null"）
     again = client.delete(f"/api/v1/activities/{created['id']}", headers=headers)
     assert again.status_code == 404
     assert again.json()["code"] == "not_found"

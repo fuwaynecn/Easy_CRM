@@ -10,18 +10,15 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 
 
 def get_db() -> Iterator[Session]:
-    """每个请求一个会话；**异常路径显式回滚**。
+    """每个请求一个会话，收尾只有 ``close()``。
 
-    服务层在业务校验失败时可能已经改过内存对象（完成冻结/取消冻结那类判定若顺序
-    写错就是这种形态），不 commit 不代表会话里干净。这里不依赖 ``close()`` 的隐式
-    回滚：显式 rollback 让"失败请求不落库"成为可读的约定，也保证连接回到池里时
-    没有半截事务。
+    **会话由 `close()` 负责回滚未提交事务，别删 try/finally**：服务层在业务校验
+    失败时可能已经改过内存对象，这些改动不能落库；``Session.close()`` 会回滚活动
+    事务并把连接还池。这里不需要、也不应再补一次 rollback（补了是死代码，反而让人
+    以为"没有它就漏数据"）。
     """
     db = SessionLocal()
     try:
         yield db
-    except Exception:
-        db.rollback()
-        raise
     finally:
         db.close()

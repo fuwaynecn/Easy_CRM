@@ -176,6 +176,7 @@ def test_delete_follow_up_then_404(client, db):
 
     removed = client.delete(f"/api/v1/follow_ups/{created['id']}", headers=headers)
     assert removed.status_code == 204
+    assert removed.content == b""  # 204 不许带 body（FastAPI 里真会退化出 "null"）
 
     resp = client.get(f"/api/v1/follow_ups/{created['id']}", headers=headers)
     assert resp.status_code == 404
@@ -185,9 +186,9 @@ def test_delete_follow_up_then_404(client, db):
 def test_400_does_not_leak_dirty_state(client, db):
     """失败请求既不能落库，也不能让后续请求读到"改了一半"的行。
 
-    `PATCH status=done` 与 `cancel 后改 content` 都是 service 先校验再抛 400；
-    路由层没有 try/except，靠 `get_db` 在异常路径 rollback + close 兜底。
-    """
+    这条验的是**服务层在改内存之前就抛 400**（完成必须走 /done、取消后冻结内容），
+    不是 `get_db` 兜的：`get_db` 收尾只有 `close()`，回滚是 `close()` 的固有行为，
+    没有额外的 `except: rollback` 分支。"""
     f = _setup(db)
     headers = _auth(client, "sales_a")
     created = client.post(
