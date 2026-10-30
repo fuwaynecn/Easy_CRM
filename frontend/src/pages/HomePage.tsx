@@ -39,6 +39,8 @@ export default function HomePage() {
         queryClient.invalidateQueries({ queryKey: ["follow_ups"] }),
         queryClient.invalidateQueries({ queryKey: ["timeline"] }),
         queryClient.invalidateQueries({ queryKey: ["customer"] }),
+        // 勾选"顺便写一条跟进"会推进 last_activity_at，客户列表的「最后跟进」也要新
+        queryClient.invalidateQueries({ queryKey: ["customers"] }),
       ]);
     },
     onError: (err) => setActionError(errorMessage(err, "标记完成失败")),

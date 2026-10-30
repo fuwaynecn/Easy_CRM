@@ -100,12 +100,15 @@ export function ActivityFormModal({ customerId, draft, onClose, onSaved }: Props
     },
     onSuccess: async () => {
       // 写跟进会推进 last_activity_at、可能新增待办、必然新增时间线条目：
-      // 三个缓存一起失效，首页/详情/时间线不会各自留旧数据。
+      // 这几个缓存一起失效，首页/客户列表/详情/时间线不会各自留旧数据。
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["timeline", customerId] }),
         queryClient.invalidateQueries({ queryKey: ["follow_ups"] }),
         queryClient.invalidateQueries({ queryKey: ["home"] }),
         queryClient.invalidateQueries({ queryKey: ["customer", customerId] }),
+        // 客户列表的「最后跟进」读的是 customers.last_activity_at：不失效列表，
+        // 用户得切页或等 staleTime 过期才看得到新日期。
+        queryClient.invalidateQueries({ queryKey: ["customers"] }),
       ]);
       onSaved();
     },

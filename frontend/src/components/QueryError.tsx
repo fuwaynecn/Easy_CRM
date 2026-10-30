@@ -24,8 +24,15 @@ interface QueryErrorProps {
  * 两处调用方的 403 兜底文案本来就相同，所以这里固定成一个常量，避免哪天只改一处。
  */
 export function QueryError({ error, fallback, onRetry, children }: QueryErrorProps) {
+  // 401 与 403 都不是"重试就能过"的错误，文案也不能通用：401 是会话过期
+  // （client.ts 的 refresh 已经试过一次），要明确让用户重新登录；403 是越权。
+  const unauthorized = error instanceof ApiError && error.status === 401;
   const forbidden = error instanceof ApiError && error.status === 403;
-  const message = forbidden ? errorMessage(error, "无权查看该客户") : errorMessage(error, fallback);
+  const message = unauthorized
+    ? "登录已过期，请重新登录"
+    : forbidden
+      ? errorMessage(error, "无权查看该客户")
+      : errorMessage(error, fallback);
   // ApiError 的 status 是 HTTP 状态码。不属于 ApiError 的错误是网络/DNS 中断（没有状态码），
   // 那种情况值得重试一次；0 是前端自产的契约错误（见 AuthProvider），同样不该重试。
   const retryable = !(error instanceof ApiError) || error.status >= 500;

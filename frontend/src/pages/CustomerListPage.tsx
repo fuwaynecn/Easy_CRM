@@ -16,18 +16,21 @@ import {
   PROCUREMENT_TYPE_OPTIONS,
   labelOf,
 } from "../constants/customerLabels";
+import { formatDay } from "../constants/datetime";
 
 /**
  * 移动卡片上的「最后跟进」文案：null 显示「未跟进」，有值只给「月-日」。
  * 375px 下这一行还要放负责人，完整年月日既放不下也没必要（跨年歧义见报告）。
+ *
+ * **按上海日期取月日**（`formatDay(value).slice(5)`）：`getMonth()/getDate()` 是浏览器
+ * 本地时区，同一行记录在不同机器上会显示不同日期——`last_activity_at` 是 datetime，
+ * 上海凌晨 0–8 点的事件在 UTC 机器上会被算成前一天。
  */
 function lastFollowUpText(value: string | null): string {
   if (value === null) return "未跟进";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `最后跟进 ${month}-${day}`;
+  const day = formatDay(value);
+  if (day === "—") return "—";
+  return `最后跟进 ${day.slice(5)}`;
 }
 
 // 公海徽标。判定只有一条：owner_id === null（与详情页 publicPool/writable 同一口径）。

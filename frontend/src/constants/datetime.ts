@@ -26,9 +26,11 @@ const clockFormatter = new Intl.DateTimeFormat("en-GB", {
   timeZone: SHANGHAI,
   hour: "2-digit",
   minute: "2-digit",
-  hour12: false,
   // `hour12: false` 在部分 ICU 版本里会把午夜格式化成 "24:00"，拼进
   // `datetime-local` 就是非法值。`hourCycle: "h23"` 才是 00–23。
+  //
+  // **只留 `hourCycle`，不要同时写 `hour12: false`**：V8 实测 `hour12` 存在时
+  // `hourCycle` 被忽略（那时出 `00:00` 只是 en-GB 的 ICU 默认，不是这条选项的功劳）。
   hourCycle: "h23",
 });
 
