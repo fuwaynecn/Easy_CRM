@@ -196,3 +196,68 @@ def test_get_missing_follow_up_is_404(db):
     f = _setup(db)
     with pytest.raises(NotFoundError):
         get_follow_up(db, f["sa"], 999_999)
+
+
+def test_get_soft_deleted_follow_up_is_404_not_403(db):
+    """已删待办对外表现为不存在：自己的删了是 404，别部门的删了也不能变成 403。
+
+    403 会泄漏"这条 id 曾经存在"。别部门 + 已删同时命中时，404 必须优先于 403，
+    因此存在性探针同样要带 ``deleted_at IS NULL``。
+    """
+    f = _setup(db)
+    mine = _insert(db, f["sa"], f["cust_a"])
+    mine.deleted_at = datetime.now(UTC)
+    foreign = _insert(db, f["sb"], f["cust_b"])
+    foreign.deleted_at = datetime.now(UTC)
+    db.commit()
+
+    with pytest.raises(NotFoundError):
+        get_follow_up(db, f["sa"], mine.id)
+    with pytest.raises(NotFoundError):
+        get_follow_up(db, f["sa"], foreign.id)
+
+
+def test_list_by_invisible_customer_is_403(db):
+    """筛一个看不见的客户是 403，不是空列表：空列表会被读成"这客户没有待办"。"""
+    f = _setup(db)
+    with pytest.raises(ForbiddenError):
+        list_follow_ups(db, f["sa"], customer_id=f["cust_b"].id)
+
+
+def test_same_due_at_orders_by_id_and_pages_stably(db):
+    """同一到期时刻的三条按 id 升序（第二排序键），page_size=2 翻页不重不漏。
+
+    待办按到期时间**升序**（最该先做的排最前），因此这里的 id 顺序也是升序；
+    只按 ``due_at`` 排时同一时刻的顺序由数据库自由决定，翻页会漏行或重行。
+    """
+    f = _setup(db)
+    first = _insert(db, f["sa"], f["cust_a"], content="一", due_at=NOW)
+    second = _insert(db, f["sa"], f["cust_a"], content="二", due_at=NOW)
+    third = _insert(db, f["sa"], f["cust_a"], content="三", due_at=NOW)
+
+    page1, total1 = list_follow_ups(db, f["sa"], page=1, page_size=2)
+    page2, total2 = list_follow_ups(db, f["sa"], page=2, page_size=2)
+
+    assert (total1, total2) == (3, 3)
+    assert [item.id for item in page1] == [first.id, second.id]
+    assert [item.id for item in page2] == [third.id]
+
+
+def test_mine_combines_with_status_filter(db):
+    """`mine` 与 `status` 是 AND 叠加，不是互相覆盖。
+
+    两条待办都写在销售 A 的客户上，但由**同部门同事**创建：因此本用例同时钉住
+    「我的待办按客户负责人、不按创建人」——若 mine 改成 ``created_by == me``，
+    这里一条都查不到。
+    """
+    f = _setup(db)
+    pending = _insert(db, f["sc"], f["cust_a"], content="待办")
+    done = _insert(db, f["sc"], f["cust_a"], content="已完成", status="done")
+
+    done_items, done_total = list_follow_ups(db, f["sa"], mine=True, status="done")
+    assert done_total == 1
+    assert [item.id for item in done_items] == [done.id]
+
+    all_items, all_total = list_follow_ups(db, f["sa"], mine=True)
+    assert all_total == 2
+    assert {item.id for item in all_items} == {pending.id, done.id}
