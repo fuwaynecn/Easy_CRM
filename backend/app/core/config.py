@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     # 运行环境（dev / test / prod ...）。仅用于启动配置告警的判定，不参与业务逻辑。
     environment: str = "dev"
+    scheduler_enabled: bool = True
+    scheduler_timezone: str = "Asia/Shanghai"
 
 
 settings = Settings()

@@ -13,6 +13,10 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.main import create_app
 
+# 测试不启动后台 scheduler：TestClient 的 with 会触发 lifespan，
+# 真起线程会让 pytest 退出时挂住，也会和 test_recycle 的 advisory lock 抢锁。
+settings.scheduler_enabled = False
+
 
 def _urls() -> tuple[str, str]:
     """推导管理连接与测试库连接。

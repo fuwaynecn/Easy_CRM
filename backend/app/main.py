@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -22,6 +23,7 @@ from app.modules.opportunities.router import router as opportunities_router
 from app.modules.pools.router import router as pools_router
 from app.modules.timeline.router import router as timeline_router
 from app.modules.users.router import router as users_router
+from app.scheduler import shutdown_scheduler, start_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,17 @@ def _warn_once(key: str, message: str) -> None:
     logger.warning(message)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if settings.scheduler_enabled:
+        start_scheduler()
+    try:
+        yield
+    finally:
+        if settings.scheduler_enabled:
+            shutdown_scheduler()
+
+
 def create_app() -> FastAPI:
     if settings.jwt_secret == DEV_JWT_SECRET_PLACEHOLDER:
         _warn_once(
@@ -56,7 +69,7 @@ def create_app() -> FastAPI:
             "生产环境必须设置 COOKIE_SECURE=true，否则 refresh cookie 会以明文 HTTP 传输",
         )
 
-    app = FastAPI(title="Easy CRM API", version="0.1.0")
+    app = FastAPI(title="Easy CRM API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
