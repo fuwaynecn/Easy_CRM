@@ -7,13 +7,17 @@
 from io import BytesIO
 
 from openpyxl import Workbook, load_workbook
+from sqlalchemy import func, select
 
+from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
 from app.modules.imports.service import (
     CUSTOMER_TEMPLATE_COLUMNS,
+    ParsedCustomerRow,
     build_customer_template,
+    validate_customer_rows,
 )
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
@@ -131,6 +135,10 @@ def test_upload_valid_rows_creates_validated_job(client, db, tmp_path):
     assert body["error_rows"] == 0
     assert body["errors"] == []
     assert (tmp_path / "imports" / f"{body['id']}.xlsx").exists()
+    # 落盘的是上传原文，不是重新序列化的结果（Task 11 commit 要重新解析这份文件）
+    assert (tmp_path / "imports" / f"{body['id']}.xlsx").read_bytes() == content
+    # 上传阶段只校验，不写客户
+    assert db.scalar(select(func.count()).select_from(Customer)) == 0
 
 
 def test_upload_duplicate_name_is_skipped_not_error(client, db):
@@ -146,6 +154,52 @@ def test_upload_duplicate_name_is_skipped_not_error(client, db):
     assert body["skipped_rows"] == 1
     assert body["error_rows"] == 0
     assert body["errors"] == []
+
+
+def test_validate_existing_duplicate_stays_out_of_valid(db):
+    """重名必须只进 skipped：一旦同时进 valid，commit 就会覆盖已有客户。"""
+    f = _setup(db)
+    create_customer(db, f["sa"], CustomerCreate(name="甲制造有限公司"))
+
+    result = validate_customer_rows(
+        db,
+        f["admin"],
+        [
+            # 尾随空格是有意的：命中说明重名判定走了 normalize_name
+            ParsedCustomerRow(
+                row=2,
+                name="甲制造有限公司 ",
+                owner_username="sales_a",
+                fields={},
+            )
+        ],
+    )
+
+    assert result.valid == []
+    assert len(result.skipped) == 1
+    assert result.errors == []
+
+
+def test_validate_in_file_duplicate_keeps_one_valid(db):
+    """文件内同名：第一行有效，第二行跳过，且不算错误。"""
+    f = _setup(db)
+
+    result = validate_customer_rows(
+        db,
+        f["admin"],
+        [
+            ParsedCustomerRow(
+                row=2, name="甲制造有限公司", owner_username="sales_a", fields={}
+            ),
+            ParsedCustomerRow(
+                row=3, name="甲制造有限公司 ", owner_username="sales_a", fields={}
+            ),
+        ],
+    )
+
+    assert len(result.valid) == 1
+    assert len(result.skipped) == 1
+    assert result.errors == []
 
 
 def test_upload_unknown_owner_is_row_error(client, db):
