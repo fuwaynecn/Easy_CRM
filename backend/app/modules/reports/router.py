@@ -9,8 +9,8 @@ from sqlalchemy.orm import Session
 from app.core.deps import CurrentUser
 from app.db.session import get_db
 from app.modules.reports.common import resolve_period
-from app.modules.reports.schemas import FunnelReport, WinRateReport
-from app.modules.reports.service import funnel, win_rate
+from app.modules.reports.schemas import CycleReport, FunnelReport, WinRateReport
+from app.modules.reports.service import cycle, funnel, win_rate
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -31,3 +31,13 @@ def get_win_rate(
     date_to: date | None = None,
 ):
     return win_rate(db, user, resolve_period(date_from, date_to))
+
+
+@router.get("/cycle", response_model=CycleReport)
+def get_cycle(
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+    date_from: date | None = None,
+    date_to: date | None = None,
+):
+    return cycle(db, user, resolve_period(date_from, date_to))

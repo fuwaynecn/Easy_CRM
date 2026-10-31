@@ -249,3 +249,49 @@ def test_win_rate_groups_by_current_owner_department(db):
     }
     assert (east.won, east.lost, east.rate) == (1, 0, 100.0)
     assert (south.won, south.lost, south.rate) == (0, 1, 0.0)
+
+
+from app.modules.reports.service import cycle
+
+
+def _set_created_at(db, opp, moment: datetime):
+    db.execute(
+        update(Opportunity).where(Opportunity.id == opp.id).values(created_at=moment)
+    )
+    db.commit()
+
+
+def test_cycle_uses_won_at_minus_created_at(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    opp = _opp(db, f["sa"], f["cust_a"])
+    _set_created_at(db, opp, datetime(2026, 10, 5, tzinfo=UTC))
+    _win(db, f["sa"], opp, at=datetime(2026, 10, 15, tzinfo=UTC))
+
+    report = cycle(db, f["admin"], period)
+
+    assert report.won_count == 1
+    assert report.avg_days == 10.0
+    assert report.by_owner[0].owner_name == "销售A"
+    assert report.by_month[0].month == "2026-10"
+
+
+def test_cycle_month_bucket_uses_shanghai_timezone(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 11, 30).date(), now=NOW
+    )
+    # 2026-10-31 15:30 UTC = 2026-10-31 23:30 上海 → 10 月
+    oct_opp = _opp(db, f["sa"], f["cust_a"], name="十月")
+    _set_created_at(db, oct_opp, datetime(2026, 10, 20, tzinfo=UTC))
+    _win(db, f["sa"], oct_opp, at=datetime(2026, 10, 31, 15, 30, tzinfo=UTC))
+    # 2026-10-31 16:30 UTC = 2026-11-01 00:30 上海 → 11 月
+    nov_opp = _opp(db, f["sa"], f["cust_a"], name="十一月")
+    _set_created_at(db, nov_opp, datetime(2026, 10, 25, tzinfo=UTC))
+    _win(db, f["sa"], nov_opp, at=datetime(2026, 10, 31, 16, 30, tzinfo=UTC))
+
+    report = cycle(db, f["admin"], period)
+
+    assert [row.month for row in report.by_month] == ["2026-10", "2026-11"]

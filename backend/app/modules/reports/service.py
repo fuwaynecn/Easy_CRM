@@ -15,9 +15,13 @@ from app.modules.opportunities.models import OPPORTUNITY_STAGES, Opportunity
 from app.modules.reports.common import (
     Period,
     latest_stage_subquery,
+    month_bucket,
     opportunity_scope_conditions,
 )
 from app.modules.reports.schemas import (
+    CycleMonthRead,
+    CycleOwnerRead,
+    CycleReport,
     DepartmentRateRead,
     FunnelReport,
     FunnelStageRead,
@@ -129,4 +133,64 @@ def win_rate(db: Session, actor: User, period: Period) -> WinRateReport:
         total=total_won + total_lost,
         rate=_rate(total_won, total_lost),
         by_department=by_department,
+    )
+
+
+def _avg_days(value) -> float | None:
+    return round(float(value), 1) if value is not None else None
+
+
+def cycle(db: Session, actor: User, period: Period) -> CycleReport:
+    """平均成交周期：当前赢单机会的 `won_at - created_at` 天数均值。
+
+    期间按 `won_at` 归属；重开过的机会 `won_at` 被清空，不再计入。
+    """
+    days = func.extract(
+        "epoch", Opportunity.won_at - Opportunity.created_at
+    ) / 86400.0
+    base = [
+        *opportunity_scope_conditions(actor),
+        Opportunity.stage == "won",
+        Opportunity.won_at >= period.start,
+        Opportunity.won_at < period.end,
+    ]
+    won_count, avg_days = db.execute(
+        select(func.count(), func.avg(days)).where(*base)
+    ).one()
+    month = month_bucket(Opportunity.won_at)
+    owner_rows = db.execute(
+        select(User.id, User.display_name, func.count(), func.avg(days))
+        .join(User, User.id == Opportunity.owner_id)
+        .where(*base)
+        .group_by(User.id, User.display_name)
+        .order_by(User.display_name.asc(), User.id.asc())
+    ).all()
+    month_rows = db.execute(
+        select(month.label("month"), func.count(), func.avg(days))
+        .where(*base)
+        .group_by(month)
+        .order_by(month.asc())
+    ).all()
+    return CycleReport(
+        date_from=period.date_from,
+        date_to=period.date_to,
+        won_count=int(won_count),
+        avg_days=_avg_days(avg_days),
+        by_owner=[
+            CycleOwnerRead(
+                owner_id=row.id,
+                owner_name=row.display_name,
+                won_count=int(row[2]),
+                avg_days=_avg_days(row[3]),
+            )
+            for row in owner_rows
+        ],
+        by_month=[
+            CycleMonthRead(
+                month=row.month,
+                won_count=int(row[1]),
+                avg_days=_avg_days(row[2]),
+            )
+            for row in month_rows
+        ],
     )
