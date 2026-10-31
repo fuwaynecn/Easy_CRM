@@ -22,6 +22,7 @@ const NAV: {
   { to: "/opportunities", label: "机会", end: true },
   { to: "/opportunities/board", label: "看板" },
   { to: "/reports", label: "报表" },
+  { to: "/import", label: "导入", managerOrAdmin: true },
   { to: "/admin/pool-rules", label: "公海规则", adminOnly: true },
 ];
 
@@ -68,8 +69,8 @@ export function AppShell({ children }: { children: ReactNode }) {
           {NAV.filter(
             (item) =>
               (!item.adminOnly || user?.role === "admin") &&
-              // `managerOrAdmin` 预留给 Task 12 的「导入」（仅主管/管理员可见）；
-              // 目前没有任何导航项使用它，加上是为了让过滤规则只有一个真值。
+              // `managerOrAdmin`：隐藏「导入」等仅主管/管理员可用的项。
+              // 隐藏本身不是权限，`ImportPage` 内还有一道页面级闸门。
               (!item.managerOrAdmin || user?.role !== "sales"),
           ).map((item) => (
             <NavLink

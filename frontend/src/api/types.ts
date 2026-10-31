@@ -401,3 +401,22 @@ export interface PoolRules {
   protect_with_pending_followup: boolean;
   recycle_notice_days: number;
 }
+
+export interface ImportErrorItem {
+  row: number;
+  column: string;
+  message: string;
+}
+
+export interface ImportJob {
+  id: number;
+  kind: string;
+  file_name: string | null;
+  status: "validating" | "validated" | "importing" | "done" | "failed";
+  total_rows: number;
+  success_rows: number;
+  skipped_rows: number;
+  error_rows: number;
+  errors: ImportErrorItem[];
+  created_at: string;
+}

@@ -9,6 +9,7 @@ import AdminPoolRulesPage from "./pages/AdminPoolRulesPage";
 import CustomerDetailPage from "./pages/CustomerDetailPage";
 import CustomerListPage from "./pages/CustomerListPage";
 import HomePage from "./pages/HomePage";
+import ImportPage from "./pages/ImportPage";
 import LoginPage from "./pages/LoginPage";
 import OpportunityBoardPage from "./pages/OpportunityBoardPage";
 import OpportunityDetailPage from "./pages/OpportunityDetailPage";
@@ -85,6 +86,16 @@ export default function App() {
                 <RequireAuth>
                   <AppShell>
                     <ReportsPage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/import"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <ImportPage />
                   </AppShell>
                 </RequireAuth>
               }

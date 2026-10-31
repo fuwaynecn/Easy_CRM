@@ -91,7 +91,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       ...init,
       credentials: "include",
       headers: {
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        // 只有字符串 body 才是我们序列化过的 JSON；`FormData` 上传必须让浏览器
+        // 自己写 multipart 边界，手写 Content-Type 会让后端解析失败。
+        ...(typeof init.body === "string"
+          ? { "Content-Type": "application/json" }
+          : {}),
         ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         ...(init.headers ?? {}),
       },
@@ -131,6 +135,36 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
+/**
+ * 下载二进制响应（模板 `.xlsx` 等）：不能走 `request`——它无条件 `resp.json()`，
+ * 会把二进制读坏并吞掉错误文案。401 刷新逻辑与 `request` 保持一致。
+ */
+async function requestBlob(path: string): Promise<Blob> {
+  const send = (): Promise<Response> =>
+    fetch(path, {
+      credentials: "include",
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+    });
+
+  let resp = await send();
+  if (resp.status === 401 && accessToken) {
+    const ok = await tryRefresh();
+    if (ok) resp = await send();
+  }
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => null);
+    const err = body as { code?: unknown; message?: unknown; detail?: unknown } | null;
+    const rawMessage = err?.message;
+    const code = typeof err?.code === "string" && err.code !== "" ? err.code : "error";
+    const message =
+      typeof rawMessage === "string" && rawMessage.trim() !== ""
+        ? rawMessage
+        : fallbackMessage(resp.status);
+    throw new ApiError(resp.status, code, message, err?.detail);
+  }
+  return resp.blob();
+}
+
 export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown) =>
@@ -141,4 +175,7 @@ export const api = {
   patch: <T>(path: string, body: unknown) =>
     request<T>(path, { method: "PATCH", body: JSON.stringify(body) }),
   del: (path: string) => request<void>(path, { method: "DELETE" }),
+  upload: <T>(path: string, body: FormData) =>
+    request<T>(path, { method: "POST", body }),
+  blob: (path: string) => requestBlob(path),
 };
