@@ -26,7 +26,10 @@ manager/sales 必须带 ``department_id``；登录名至少 3 个字符；``Cust
 把 sales 的作用域错写成"本部门 + 公海"也能全绿。
 """
 
+from io import BytesIO
+
 import pytest
+from openpyxl import Workbook
 from sqlalchemy import select
 
 from app.modules.contacts.models import Contact
@@ -763,3 +766,84 @@ def test_p4_pool_claim_assign_release_and_timeline(client, db):
     assert release_item["from_owner_name"] == "王丽"
     assert release_item["to_owner_name"] is None
     assert release_item["content"] == "客户长期不回复"
+
+
+def _xlsx_rows(names: list[str], owner: str) -> bytes:
+    """按模板表头拼一份最小客户导入文件（只填必填的两列）。"""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "客户"
+    sheet.append([
+        "客户名称*", "负责人*", "简称", "编码", "行业", "地区", "地址", "网站",
+        "规模", "等级", "来源", "采购方式", "预算状态", "客户状态", "备注",
+    ])
+    for name in names:
+        sheet.append([name, owner, "", "", "", "", "", "", "", "", "", "", "", "", ""])
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def _upload(client, headers: dict[str, str], content: bytes):
+    return client.post(
+        "/api/v1/imports",
+        headers=headers,
+        data={"kind": "customers"},
+        files={
+            "file": (
+                "e2e.xlsx",
+                content,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+
+def test_p5_import_then_report_e2e(client, db):
+    """导入 3 个客户 → 客户列表可见 → 建机会 → 漏斗能看到。"""
+    _setup(db)
+    headers = _auth(client, "admin")
+
+    upload = _upload(
+        client, headers, _xlsx_rows(["E2E甲公司", "E2E乙公司", "E2E丙公司"], "sales1")
+    )
+    assert upload.status_code == 201, upload.text
+    job = upload.json()
+    assert job["status"] == "validated"
+
+    commit = client.post(f"/api/v1/imports/{job['id']}/commit", headers=headers)
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["success_rows"] == 3
+
+    listed = client.get("/api/v1/customers?keyword=E2E", headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["total"] == 3
+
+    customer_id = listed.json()["items"][0]["id"]
+    created = client.post(
+        "/api/v1/opportunities",
+        headers=headers,
+        json={"customer_id": customer_id, "name": "E2E机会", "amount": "1000.00"},
+    )
+    assert created.status_code == 201, created.text
+
+    funnel = client.get("/api/v1/reports/funnel", headers=headers)
+    assert funnel.status_code == 200, funnel.text
+    assert sum(row["count"] for row in funnel.json()["stages"]) >= 1
+
+
+def test_p5_import_500_rows(client, db):
+    """验收要求：500 行单次导入成功。"""
+    _setup(db)
+    headers = _auth(client, "admin")
+    names = [f"批量客户{i:04d}" for i in range(500)]
+
+    upload = _upload(client, headers, _xlsx_rows(names, "sales1"))
+    assert upload.status_code == 201, upload.text
+    job = upload.json()
+    assert job["total_rows"] == 500
+    assert job["error_rows"] == 0
+
+    commit = client.post(f"/api/v1/imports/{job['id']}/commit", headers=headers)
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["success_rows"] == 500
