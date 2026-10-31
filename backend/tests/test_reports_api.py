@@ -71,3 +71,15 @@ def test_win_rate_shape_and_default_period(client, db):
     assert body["rate"] is None
     assert body["by_department"] == []
     assert body["date_from"] <= body["date_to"]
+
+
+def test_activities_rejects_unknown_granularity(client, db):
+    _setup(db)
+    headers = _auth(_token(client, "sales_a"))
+
+    resp = client.get(
+        "/api/v1/reports/activities?granularity=month", headers=headers
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "invalid_value"

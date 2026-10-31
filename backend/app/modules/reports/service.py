@@ -10,15 +10,24 @@ from decimal import Decimal
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
+from app.core.errors import InvalidValueError
+from app.modules.activities.models import Activity
 from app.modules.departments.models import Department
 from app.modules.opportunities.models import OPPORTUNITY_STAGES, Opportunity
 from app.modules.reports.common import (
     Period,
+    activity_scope_conditions,
+    day_bucket,
+    fill_buckets,
     latest_stage_subquery,
     month_bucket,
     opportunity_scope_conditions,
+    week_bucket,
 )
 from app.modules.reports.schemas import (
+    ActivityBucketRead,
+    ActivityOwnerRead,
+    ActivityReport,
     CycleMonthRead,
     CycleOwnerRead,
     CycleReport,
@@ -270,4 +279,59 @@ def performance(db: Session, actor: User, period: Period) -> PerformanceReport:
         total_amount=sum((row.amount for row in by_owner), Decimal(0)),
         by_owner=by_owner,
         by_month=by_month,
+    )
+
+
+ACTIVITY_GRANULARITIES = ("day", "week")
+
+
+def activities(
+    db: Session,
+    actor: User,
+    period: Period,
+    granularity: str,
+) -> ActivityReport:
+    """期间跟进量：按作者分组，按天/周聚合，并补齐空桶。"""
+    if granularity not in ACTIVITY_GRANULARITIES:
+        raise InvalidValueError("granularity 只能是 day 或 week")
+    base = [
+        *activity_scope_conditions(actor),
+        Activity.activity_at >= period.start,
+        Activity.activity_at < period.end,
+    ]
+    owner_rows = db.execute(
+        select(User.id, User.display_name, func.count().label("count"))
+        .select_from(Activity)
+        .join(User, User.id == Activity.created_by)
+        .where(*base)
+        .group_by(User.id, User.display_name)
+        .order_by(func.count().desc(), User.id.asc())
+    ).all()
+    bucket = day_bucket if granularity == "day" else week_bucket
+    bucket = bucket(Activity.activity_at)
+    bucket_rows = db.execute(
+        select(bucket.label("bucket"), func.count().label("count"))
+        .where(*base)
+        .group_by(bucket)
+        .order_by(bucket.asc())
+    ).all()
+    series = fill_buckets(
+        {row.bucket: int(row.count) for row in bucket_rows}, period, granularity
+    )
+    return ActivityReport(
+        date_from=period.date_from,
+        date_to=period.date_to,
+        granularity=granularity,
+        total=sum(count for _, count in series),
+        by_owner=[
+            ActivityOwnerRead(
+                user_id=row.id,
+                user_name=row.display_name,
+                count=int(row.count),
+            )
+            for row in owner_rows
+        ],
+        series=[
+            ActivityBucketRead(bucket=key, count=count) for key, count in series
+        ],
     )

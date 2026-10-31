@@ -14,6 +14,8 @@ import pytest
 from sqlalchemy import update
 
 from app.core.errors import InvalidValueError
+from app.modules.activities.schemas import ActivityCreate
+from app.modules.activities.service import create_activity
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer, delete_customer
 from app.modules.departments.service import create_department
@@ -30,7 +32,7 @@ from app.modules.opportunities.service import (
     update_opportunity,
 )
 from app.modules.reports.common import resolve_period
-from app.modules.reports.service import funnel
+from app.modules.reports.service import activities, funnel
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
 
@@ -339,3 +341,94 @@ def test_performance_groups_by_owner_and_month(db):
         "销售B": Decimal("200.00"),
     }
     assert east.total_amount == Decimal("100.00")
+
+
+def _activity(db, actor, customer, *, at: datetime, content="跟进"):
+    return create_activity(
+        db,
+        actor,
+        ActivityCreate(
+            customer_id=customer.id,
+            content=content,
+            activity_at=at,
+        ),
+    )
+
+
+def test_activities_fill_empty_day_buckets(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 3).date(), now=NOW
+    )
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 1, 10, tzinfo=UTC))
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 1, 11, tzinfo=UTC))
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 3, 10, tzinfo=UTC))
+    # 区间边界外但仍「挨着」两条：半开区间 [start, end) 的上下界都要挡住它们
+    # 2026-09-30 15:59 UTC = 2026-09-30 23:59 上海，早于 period.start（10-01 00:00）
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 9, 30, 15, 59, tzinfo=UTC))
+    # 2026-10-03 16:30 UTC = 2026-10-04 00:30 上海，晚于 period.end（10-04 00:00）
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 3, 16, 30, tzinfo=UTC))
+
+    report = activities(db, f["admin"], period, "day")
+
+    assert report.total == 3
+    assert [(row.bucket, row.count) for row in report.series] == [
+        ("2026-10-01", 2), ("2026-10-02", 0), ("2026-10-03", 1),
+    ]
+    assert report.by_owner[0].user_name == "销售A"
+    assert report.by_owner[0].count == 3
+
+
+def test_activities_week_bucket_starts_monday(db):
+    f = _setup(db)
+    # 2026-10-05 是周一；10-04 是周日，应归到 09-28 那周
+    period = resolve_period(
+        datetime(2026, 9, 28).date(), datetime(2026, 10, 11).date(), now=NOW
+    )
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 4, 10, tzinfo=UTC))
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 5, 10, tzinfo=UTC))
+
+    report = activities(db, f["admin"], period, "week")
+
+    assert [(row.bucket, row.count) for row in report.series] == [
+        ("2026-09-28", 1), ("2026-10-05", 1),
+    ]
+
+
+def test_activities_scope_by_creator_department(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 1, 10, tzinfo=UTC))
+    _activity(db, f["sb"], f["cust_b"], at=datetime(2026, 10, 2, 10, tzinfo=UTC))
+
+    assert activities(db, f["boss"], period, "day").total == 1
+    assert activities(db, f["sa"], period, "day").total == 1
+    assert activities(db, f["admin"], period, "day").total == 2
+
+    admin = activities(db, f["admin"], period, "day")
+    # 量相同（各 1）时按 user id 升序，顺序不能随查询计划漂移
+    assert [row.user_name for row in admin.by_owner] == ["销售A", "销售B"]
+    assert admin.total == sum(row.count for row in admin.by_owner)
+
+
+def test_activities_by_owner_sorts_by_count(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    # 销售B 2 条、销售A 1 条：与 id 升序（A 先建、id 更小）相反。
+    # 只按 `User.id.asc()` 排序会给出 [销售A, 销售B]，本条即失败；
+    # 真正的 `count DESC, id ASC` 才给出 [销售B, 销售A]。
+    _activity(db, f["sb"], f["cust_b"], at=datetime(2026, 10, 1, 10, tzinfo=UTC))
+    _activity(db, f["sb"], f["cust_b"], at=datetime(2026, 10, 2, 10, tzinfo=UTC))
+    _activity(db, f["sa"], f["cust_a"], at=datetime(2026, 10, 3, 10, tzinfo=UTC))
+
+    report = activities(db, f["admin"], period, "day")
+
+    # 按量降序：销售B 2 条排在销售A 1 条之前（与 id 升序相反，故能钉住 count desc）
+    assert [(row.user_name, row.count) for row in report.by_owner] == [
+        ("销售B", 2), ("销售A", 1),
+    ]
+    assert report.total == 3
