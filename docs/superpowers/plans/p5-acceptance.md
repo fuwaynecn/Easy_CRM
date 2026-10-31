@@ -13,15 +13,13 @@
 
 ## 1. 自动化验证（2026-11-01 实测）
 
-环境：Windows / PowerShell；真实 PostgreSQL `127.0.0.1:55432` 的 `easycrm_test`（pytest）/
-`easycrm`（迁移）。命令均在 `E:\Wayne\Doc\CY_CRM` 下执行，`$env:TEMP` / `$env:TMP` 指向
-`.tmp\w2`。**所有 pytest 串行执行，同一时间只有一个进程。**
+环境：Windows / PowerShell；真实 PostgreSQL 16。最终可信全量在隔离实例 **55433** 的 `easycrm_test` 上串行执行（同版本 PG16、每用例重建 schema；55432 上的并发尝试结果已作废，避免同库互踩）。其余命令在 `E:\Wayne\Doc\CY_CRM` 下执行，`$env:TEMP` / `$env:TMP` 指向 `.tmp\w2`。
 
 | 项 | 命令（工作目录） | 实测结果 |
 |---|---|---|
 | Ruff | `cd backend && .venv\Scripts\ruff.exe check app tests` | `All checks passed!`（exit 0） |
 | E2E 单文件 | `cd backend && .venv\Scripts\python.exe -m pytest tests/test_e2e.py -q` | `16 passed, 1 warning in 12.43s` |
-| 后端全量 | `cd backend && .venv\Scripts\python.exe -m pytest -q` | 收集 **695**；`694 passed, 1 failed, 1 warning in 344.34s (0:05:44)`；失败项 `tests/test_home.py::test_home_api_shape`（P3 既有、与 P5 无关，见 §1.2） |
+| 后端全量 | `cd backend && $env:TEST_DATABASE_URL='postgresql+psycopg://postgres@127.0.0.1:55433/postgres'; .venv\Scripts\python.exe -m pytest -q` | **`695 passed, 1 warning in 429.03s (0:07:09)`**（隔离实例 55433；失败历史见 §1.2，已修复） |
 | 迁移 | `cd backend && .venv\Scripts\python.exe -m alembic upgrade head` | exit 0（库已在 head，无 `Running upgrade` 输出）；`alembic current` → `d9a1c3e5f7b8 (head)` |
 | 前端构建 | `cd frontend && npm.cmd run build` | `tsc --noEmit && vite build` exit 0：`119 modules transformed`；`dist/index.html 0.40 kB (gzip 0.27)`、`dist/assets/index-Dfw2ObZD.css 17.39 kB (gzip 3.84)`、`dist/assets/index-ZFtuAPrk.js 311.30 kB (gzip 91.15)`；`built in 2.27s` |
 
@@ -40,12 +38,11 @@ P4 基线 **652**（`p4-acceptance.md` §1）→ 当前 **695 收集**，P5 净�
 | `tests/test_e2e.py` 新增（本次 Task 13） | 2 |
 | **合计** | **43** |
 
-计划里「P4 基线 652 + 报表 24 + 导入 17 + E2E 2 = 695」与实际收集数一致；差额只来自
-`test_home.py` 那一条既有用例（它一直是失败的，见下）。
+计划里「P4 基线 652 + 报表 24 + 导入 17 + E2E 2 = 695」与实际收集数一致；最终全量为 **695 passed**（见 §1.2 的修复记录）。
 
-### 1.2 全量里唯一失败项（既有，非 P5 引入）
+### 1.2 全量中出现过的 P3 时间炸弹（已修复，非 P5）
 
-`tests/test_home.py::test_home_api_shape` 失败：
+Task 13 首次全量在 2026-11-01 01:42（上海）执行时是 `694 passed, 1 failed`，失败项 `tests/test_home.py::test_home_api_shape`：
 
 ```
 assert [] == ['今天的待办']
@@ -56,12 +53,10 @@ assert [] == ['今天的待办']
 - 夹具用 `NOW = 2026-10-31 01:00 UTC`（上海 2026-10-31 09:00）建待办 `due_at`；
 - 断言走 `GET /api/v1/home`，服务端 `home/service.py` 用**真实当前时间**切「今日」区间
   `[上海零点, 次日零点)`；
-- 本次执行的真实时间是 2026-11-01 01:42（上海），这条待办已落到昨天，于是进入「已逾期」，
+- 2026-11-01 01:42（上海）时这条待办已落到昨天，于是进入「已逾期」，
   `today.items` 为空。
 
-该用例单独运行同样失败（`1 failed in 1.16s`），因此与本次改动、与测试执行顺序都无关：它是一条
-**过了 2026-10-31 就必红**的时间炸弹。Task 13 允许改动的文件只有 `backend/tests/test_e2e.py`
-与三份文档，未顺手修改它，列入 §6 第 10 条并转 P6。
+该用例单独运行同样失败，证明它与 P5、与测试执行顺序都无关：它是一条**过了 2026-10-31 就必红**的时间炸弹。控制器批准了**独立的测试修复提交** `1662b45`：把 `test_home_api_shape` 的 `due_at` 改成「上海今天 01:00」（`datetime.now(ZoneInfo("Asia/Shanghai")).replace(hour=1,...)`），不再依赖固定日期；其余使用确定性 `summary(..., now=NOW)` 的用例未动。修复后 `test_home.py` 单独 19 passed，全量 **695 passed**。
 
 ---
 
@@ -211,14 +206,11 @@ assert [] == ['今天的待办']
 8. **前端无单测**：`tsc --noEmit && vite build` 是唯一门禁；375px 与空态靠人工。
 9. **`commit` 没有并发锁**：同一 job 被两个请求同时 commit 时，没有行锁/幂等键；前端在
    pending 时禁用按钮，但**API 客户端必须自己避免并发 commit**。延迟到 P6。
-10. **`tests/test_home.py::test_home_api_shape` 是时间炸弹（既有）**：夹具把待办 `due_at` 写死成
-    2026-10-31（上海），却调用真实时钟的 `GET /api/v1/home`，2026-11-01 起必红（详见 §1.2）。
-    与 P5 无关，本次未修，P6 第一件事建议改成相对 `datetime.now(UTC)` 或冻结时钟。
-11. **损坏/丢失文件失败只记 `error_rows=1`**：上传阶段的 `total_rows` / `skipped_rows` 保留，
+10. **损坏/丢失文件失败只记 `error_rows=1`**：上传阶段的 `total_rows` / `skipped_rows` 保留，
     前端会同时看到「总行数 N、错误 1 行」，这是刻意的（重传前保留统计），不是丢数据。
-12. **校验是同步的**：上传在请求里完成解析与逐行校验（5000 行级别可接受），前端**没有轮询**；
+11. **校验是同步的**：上传在请求里完成解析与逐行校验（5000 行级别可接受），前端**没有轮询**；
     `getImportJob` 是为将来轮询预留的导出，目前页面未使用。
-13. **页面 375px 只覆盖了公海（P4）、报表与导入（P5 运行时）**：登录页、客户列表、机会列表
+12. **页面 375px 只覆盖了公海（P4）、报表与导入（P5 运行时）**：登录页、客户列表、机会列表
     本次没有重新量测；报表/导入的空态没有浏览器实证。P6 补。
 
 ---
