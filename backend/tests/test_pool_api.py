@@ -172,3 +172,98 @@ def test_claim_unknown_customer_returns_404(client, db):
 def test_pool_requires_login(client, db):
     _setup(db)
     assert client.get("/api/v1/pool").status_code == 401
+
+
+def test_assign_endpoint_by_admin(client, db):
+    ctx = _setup(db)
+    headers = _auth(client, "admin")
+    response = client.post(
+        f"/api/v1/customers/{ctx['pool'].id}/assign",
+        headers=headers,
+        json={"owner_id": ctx["sales1"].id, "reason": "管理员分配"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["owner_id"] == ctx["sales1"].id
+
+
+def test_manager_cannot_assign_pool_over_http_returns_403(client, db):
+    ctx = _setup(db)
+    headers = _auth(client, "boss")
+    response = client.post(
+        f"/api/v1/customers/{ctx['pool'].id}/assign",
+        headers=headers,
+        json={"owner_id": ctx["sales1"].id},
+    )
+    assert response.status_code == 403
+
+
+def test_assign_endpoint_quota_returns_409(client, db):
+    ctx = _setup(db)
+    create_customer(
+        db, ctx["admin"], CustomerCreate(name="销售二现有客户", owner_id=ctx["sales2"].id)
+    )
+    update_pool_rules(db, PoolRulesUpdate(max_owned=1))
+    headers = _auth(client, "admin")
+    response = client.post(
+        f"/api/v1/customers/{ctx['pool'].id}/assign",
+        headers=headers,
+        json={"owner_id": ctx["sales2"].id},
+    )
+    assert response.status_code == 409
+
+
+def test_release_endpoint_requires_reason(client, db):
+    ctx = _setup(db)
+    headers = _auth(client, "boss")
+    response = client.post(
+        f"/api/v1/customers/{ctx['owned'].id}/release",
+        headers=headers,
+        json={"reason": ""},
+    )
+    assert response.status_code == 422
+
+
+def test_release_endpoint_clears_owner(client, db):
+    ctx = _setup(db)
+    headers = _auth(client, "boss")
+    response = client.post(
+        f"/api/v1/customers/{ctx['owned'].id}/release",
+        headers=headers,
+        json={"reason": "长期不回复"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["owner_id"] is None
+    assert response.json()["department_id"] is None
+
+
+def test_release_pool_customer_returns_400(client, db):
+    ctx = _setup(db)
+    headers = _auth(client, "boss")
+    response = client.post(
+        f"/api/v1/customers/{ctx['pool'].id}/release",
+        headers=headers,
+        json={"reason": "无"},
+    )
+    assert response.status_code == 400
+
+
+def test_assignable_users_endpoint_manager(client, db):
+    ctx = _setup(db)
+    # 配额计数不筛客户状态：lost 客户照样占额度（裁定 7）。
+    ctx["owned"].status = "lost"
+    db.commit()
+    headers = _auth(client, "boss")
+    response = client.get("/api/v1/users/assignable", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert {item["display_name"] for item in body} == {"东区主管", "销售一", "销售二"}
+    sales1 = next(item for item in body if item["display_name"] == "销售一")
+    assert sales1["owned_count"] == 1
+    assert sales1["max_owned"] == 50
+    assert sales1["quota_remaining"] == 49
+
+
+def test_assignable_users_endpoint_sales_forbidden(client, db):
+    _setup(db)
+    headers = _auth(client, "sales1")
+    assert client.get("/api/v1/users/assignable", headers=headers).status_code == 403

@@ -11,11 +11,20 @@ from app.db.session import get_db
 from app.modules.customers.schemas import CustomerRead
 from app.modules.pools.rules import as_read, load_pool_rules, update_pool_rules
 from app.modules.pools.schemas import (
+    AssignableUserRead,
+    AssignRequest,
     PoolCustomerRead,
     PoolRuleRead,
     PoolRulesUpdate,
+    ReleaseRequest,
 )
-from app.modules.pools.service import claim_customer, list_pool
+from app.modules.pools.service import (
+    assign_customer,
+    claim_customer,
+    list_assignable_users,
+    list_pool,
+    release_customer,
+)
 
 router = APIRouter(tags=["pools"])
 
@@ -85,3 +94,48 @@ def claim(
     user: CurrentUser,
 ):
     return claim_customer(db, user, customer_id)
+
+
+@router.post("/customers/{customer_id}/assign", response_model=CustomerRead)
+def assign(
+    customer_id: int,
+    payload: AssignRequest,
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+):
+    return assign_customer(
+        db,
+        user,
+        customer_id,
+        owner_id=payload.owner_id,
+        reason=payload.reason,
+    )
+
+
+@router.post("/customers/{customer_id}/release", response_model=CustomerRead)
+def release(
+    customer_id: int,
+    payload: ReleaseRequest,
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+):
+    return release_customer(db, user, customer_id, reason=payload.reason)
+
+
+@router.get("/users/assignable", response_model=list[AssignableUserRead])
+def get_assignable_users(
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+):
+    return [
+        AssignableUserRead(
+            id=item.id,
+            display_name=item.display_name,
+            department_id=item.department_id,
+            department_name=item.department_name,
+            owned_count=item.owned_count,
+            max_owned=item.max_owned,
+            quota_remaining=item.quota_remaining,
+        )
+        for item in list_assignable_users(db, user)
+    ]

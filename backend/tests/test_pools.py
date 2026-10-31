@@ -20,6 +20,8 @@ from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer, get_customer
 from app.modules.departments.service import create_department
+from app.modules.lost_reasons.schemas import LostReasonCreate
+from app.modules.lost_reasons.service import create_lost_reason
 from app.modules.opportunities.schemas import OpportunityCreate
 from app.modules.opportunities.service import create_opportunity
 from app.modules.pools.rules import update_pool_rules
@@ -354,3 +356,366 @@ def test_claim_issues_for_update_lock(db):
     # 目标用户行锁：并发领取同一销售的配额判定必须串行；只断言“有 FOR UPDATE”
     # 会被客户行锁满足，删掉用户行锁也照样绿。
     assert any("FROM USERS" in s and "FOR UPDATE" in s for s in upper)
+
+
+# ---------------------------------------------------------------------------
+# Task 4：分配 / 释放 / 可分配用户
+# ---------------------------------------------------------------------------
+
+
+def _open_and_won_opportunities(db, ctx):
+    open_deal = create_opportunity(
+        db,
+        ctx["sales1"],
+        OpportunityCreate(customer_id=ctx["owned"].id, name="在谈机会"),
+    )
+    won_deal = create_opportunity(
+        db,
+        ctx["sales1"],
+        OpportunityCreate(customer_id=ctx["owned"].id, name="已赢机会"),
+    )
+    won_deal.stage = "won"
+    won_deal.won_at = NOW
+    lost_deal = create_opportunity(
+        db,
+        ctx["sales1"],
+        OpportunityCreate(customer_id=ctx["owned"].id, name="已输机会"),
+    )
+    lost_reason = create_lost_reason(db, LostReasonCreate(name="价格过高"))
+    lost_deal.stage = "lost"
+    lost_deal.lost_reason_id = lost_reason.id
+    db.commit()
+    return open_deal, won_deal, lost_deal
+
+
+def test_assign_by_admin_moves_owner_without_touching_last_activity(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    ctx["owned"].last_activity_at = NOW - timedelta(days=10)
+    db.commit()
+    updated = assign_customer(
+        db,
+        ctx["admin"],
+        ctx["owned"].id,
+        owner_id=ctx["sales2"].id,
+        reason="区域调整",
+    )
+    assert updated.owner_id == ctx["sales2"].id
+    assert updated.department_id == ctx["east"].id
+    assert updated.last_activity_at == NOW - timedelta(days=10)
+
+
+def test_assign_pool_by_admin_uses_assign_action(db):
+    from app.modules.pools.models import OwnerChangeLog
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    assign_customer(db, ctx["admin"], ctx["pool"].id, owner_id=ctx["sales1"].id)
+    change = db.execute(
+        select(OwnerChangeLog).where(OwnerChangeLog.customer_id == ctx["pool"].id)
+    ).scalar_one()
+    assert change.action == "assign"
+    assert change.from_owner_id is None
+    assert change.to_owner_id == ctx["sales1"].id
+
+
+def test_assign_from_owner_uses_transfer_action(db):
+    from app.modules.audit.models import AuditLog
+    from app.modules.pools.models import OwnerChangeLog
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    assign_customer(db, ctx["admin"], ctx["owned"].id, owner_id=ctx["sales2"].id)
+    change = db.execute(
+        select(OwnerChangeLog).where(OwnerChangeLog.customer_id == ctx["owned"].id)
+    ).scalar_one()
+    assert change.action == "transfer"
+    assert change.from_owner_id == ctx["sales1"].id
+    assert change.to_owner_id == ctx["sales2"].id
+    # 审计行与业务行同事务：删掉 assign 里的 write_audit_log 必须转红。
+    audit = db.execute(
+        select(AuditLog).where(AuditLog.entity_id == ctx["owned"].id)
+    ).scalar_one()
+    assert audit.entity == "customers"
+    assert audit.action == "transfer"
+    assert audit.before_json == {
+        "owner_id": ctx["sales1"].id,
+        "department_id": ctx["east"].id,
+    }
+    assert audit.after_json == {
+        "owner_id": ctx["sales2"].id,
+        "department_id": ctx["east"].id,
+    }
+    assert audit.operator_id == ctx["admin"].id
+
+
+def test_assign_syncs_open_opportunities_and_keeps_terminal(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    open_deal, won_deal, lost_deal = _open_and_won_opportunities(db, ctx)
+    assign_customer(db, ctx["admin"], ctx["owned"].id, owner_id=ctx["sales2"].id)
+    db.refresh(open_deal)
+    db.refresh(won_deal)
+    db.refresh(lost_deal)
+    assert open_deal.owner_id == ctx["sales2"].id
+    assert won_deal.owner_id == ctx["sales1"].id
+    assert lost_deal.owner_id == ctx["sales1"].id
+
+
+def test_assign_rejects_overlong_reason_without_mutating(db):
+    """原因校验必须在改归属之前：否则异常时会话里已是「已换人」的脏状态。"""
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    customer = get_customer(db, ctx["admin"], ctx["owned"].id)
+    with pytest.raises(InvalidValueError, match="200"):
+        assign_customer(
+            db,
+            ctx["admin"],
+            ctx["owned"].id,
+            owner_id=ctx["sales2"].id,
+            reason="x" * 201,
+        )
+    assert customer.owner_id == ctx["sales1"].id
+    assert customer.department_id == ctx["east"].id
+
+
+def test_manager_cannot_assign_pool_customer(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    with pytest.raises(ForbiddenError, match="公海客户"):
+        assign_customer(db, ctx["boss"], ctx["pool"].id, owner_id=ctx["sales1"].id)
+
+
+def test_manager_cannot_assign_across_departments(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    with pytest.raises(ForbiddenError, match="本部门"):
+        assign_customer(db, ctx["boss"], ctx["owned"].id, owner_id=ctx["outsider"].id)
+
+
+def test_manager_can_assign_within_department(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    updated = assign_customer(
+        db, ctx["boss"], ctx["owned"].id, owner_id=ctx["sales2"].id
+    )
+    assert updated.owner_id == ctx["sales2"].id
+
+
+def test_assign_rejects_inactive_target(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    ctx["sales2"].status = "disabled"
+    db.commit()
+    with pytest.raises(InvalidValueError, match="已停用"):
+        assign_customer(db, ctx["admin"], ctx["owned"].id, owner_id=ctx["sales2"].id)
+
+
+def test_assign_rejects_target_without_department(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    ctx["sales2"].department_id = None
+    db.commit()
+    with pytest.raises(InvalidValueError, match="未分配部门"):
+        assign_customer(db, ctx["admin"], ctx["owned"].id, owner_id=ctx["sales2"].id)
+
+
+def test_assign_rejects_admin_target(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    with pytest.raises(InvalidValueError, match="销售或主管"):
+        assign_customer(db, ctx["admin"], ctx["owned"].id, owner_id=ctx["admin"].id)
+
+
+def test_assign_same_owner_conflicts(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    with pytest.raises(ConflictError, match="已属于"):
+        assign_customer(
+            db, ctx["admin"], ctx["owned"].id, owner_id=ctx["sales1"].id
+        )
+
+
+def test_assign_quota_is_enforced(db):
+    from app.modules.pools.service import assign_customer
+
+    ctx = _setup(db)
+    # sales2 先有一个客户；上限 1；把 sales1 的客户分配给 sales2 必须 409
+    create_customer(
+        db, ctx["admin"], CustomerCreate(name="销售二现有客户", owner_id=ctx["sales2"].id)
+    )
+    update_pool_rules(db, PoolRulesUpdate(max_owned=1))
+    with pytest.raises(ConflictError, match="上限"):
+        assign_customer(db, ctx["admin"], ctx["owned"].id, owner_id=ctx["sales2"].id)
+
+
+def test_release_requires_reason(db):
+    from app.modules.pools.service import release_customer
+
+    ctx = _setup(db)
+    with pytest.raises(InvalidValueError, match="释放原因"):
+        release_customer(db, ctx["boss"], ctx["owned"].id, reason="   ")
+
+
+def test_release_clears_owner_and_department_but_keeps_opportunity_owner(db):
+    from app.modules.audit.models import AuditLog
+    from app.modules.pools.models import OwnerChangeLog
+    from app.modules.pools.service import release_customer
+
+    ctx = _setup(db)
+    open_deal, _, _ = _open_and_won_opportunities(db, ctx)
+    ctx["owned"].last_activity_at = NOW - timedelta(days=10)
+    db.commit()
+    updated = release_customer(
+        db, ctx["boss"], ctx["owned"].id, reason="客户长期不回复"
+    )
+    assert updated.owner_id is None
+    assert updated.department_id is None
+    # 释放不是跟进动作：不许把 last_activity_at 刷成“刚刚联系过”（裁定 5）。
+    assert updated.last_activity_at == NOW - timedelta(days=10)
+    db.refresh(open_deal)
+    assert open_deal.owner_id == ctx["sales1"].id
+    change = db.execute(
+        select(OwnerChangeLog).where(OwnerChangeLog.customer_id == ctx["owned"].id)
+    ).scalar_one()
+    assert change.action == "release"
+    assert change.from_owner_id == ctx["sales1"].id
+    assert change.to_owner_id is None
+    assert change.operator_id == ctx["boss"].id
+    assert change.reason == "客户长期不回复"
+    # 审计行与业务行同事务：删掉 release 里的 write_audit_log 必须转红。
+    audit = db.execute(
+        select(AuditLog).where(AuditLog.entity_id == ctx["owned"].id)
+    ).scalar_one()
+    assert audit.entity == "customers"
+    assert audit.action == "transfer"
+    assert audit.before_json == {
+        "owner_id": ctx["sales1"].id,
+        "department_id": ctx["east"].id,
+    }
+    assert audit.after_json == {"owner_id": None, "department_id": None}
+    assert audit.operator_id == ctx["boss"].id
+
+
+def test_release_rechecks_department_after_lock(db):
+    """锁后只比 owner 会漏掉“只换部门”的并发变更（owner 不变）。
+
+    场景：本会话已读到客户在华东（主管可释放）；另一个真实会话在
+    ``SELECT ... FOR UPDATE`` 之前只把 department_id 改到华南并提交。只复查
+    owner 时旧部门主管会成功释放一条已迁出的客户；同时复查 department 才能 409。
+    """
+    from app.modules.pools.service import release_customer
+
+    ctx = _setup(db)
+    assert get_customer(db, ctx["boss"], ctx["owned"].id).department_id == ctx["east"].id
+
+    fired = False
+
+    def move_department_before_lock(
+        conn, cursor, statement, parameters, context, executemany
+    ):
+        nonlocal fired
+        upper = statement.upper()
+        if fired or "FOR UPDATE" not in upper or "FROM CUSTOMERS" not in upper:
+            return
+        fired = True
+        # 第二个真实会话：只调部门，owner 保持 sales1（模拟 users.service 的调岗同步）。
+        with SessionLocal() as other:
+            customer = other.get(Customer, ctx["owned"].id)
+            customer.department_id = ctx["west"].id
+            other.commit()
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", move_department_before_lock)
+    try:
+        with pytest.raises(ConflictError, match="归属已变化"):
+            release_customer(db, ctx["boss"], ctx["owned"].id, reason="并发调岗")
+    finally:
+        event.remove(engine, "before_cursor_execute", move_department_before_lock)
+
+    assert fired, "行锁前没有触发并发部门变更，测试前提不成立"
+    # 输家不落库：归属仍是 sales1 / 华南。
+    db.rollback()
+    customer = db.get(Customer, ctx["owned"].id)
+    assert customer.owner_id == ctx["sales1"].id
+    assert customer.department_id == ctx["west"].id
+
+
+def test_release_pool_customer_is_400(db):
+    from app.modules.pools.service import release_customer
+
+    ctx = _setup(db)
+    with pytest.raises(InvalidValueError, match="已在公海"):
+        release_customer(db, ctx["boss"], ctx["pool"].id, reason="无")
+
+
+def test_release_by_sales_is_forbidden(db):
+    from app.modules.pools.service import release_customer
+
+    ctx = _setup(db)
+    with pytest.raises(ForbiddenError, match="仅主管及以上"):
+        release_customer(db, ctx["sales1"], ctx["owned"].id, reason="无")
+
+
+def test_release_cross_department_is_forbidden(db):
+    from app.modules.pools.service import release_customer
+
+    ctx = _setup(db)
+    outsider_boss = create_user(
+        db,
+        username="outsider_boss",
+        password=PASSWORD,
+        display_name="华南主管",
+        role=ROLE_MANAGER,
+        department_id=ctx["west"].id,
+    )
+    with pytest.raises(ForbiddenError):
+        release_customer(db, outsider_boss, ctx["owned"].id, reason="跨区")
+
+
+def test_assignable_users_manager_sees_only_own_department(db):
+    from app.modules.pools.service import list_assignable_users
+
+    ctx = _setup(db)
+    users = list_assignable_users(db, ctx["boss"])
+    assert {user.id for user in users} == {
+        ctx["boss"].id,
+        ctx["sales1"].id,
+        ctx["sales2"].id,
+    }
+    sales1 = next(user for user in users if user.id == ctx["sales1"].id)
+    assert sales1.owned_count == 1
+    assert sales1.max_owned == 50
+    assert sales1.quota_remaining == 49
+    assert sales1.department_name == "华东销售部"
+
+
+def test_assignable_users_admin_sees_all_departments(db):
+    from app.modules.pools.service import list_assignable_users
+
+    ctx = _setup(db)
+    users = list_assignable_users(db, ctx["admin"])
+    assert {user.id for user in users} == {
+        ctx["boss"].id,
+        ctx["sales1"].id,
+        ctx["sales2"].id,
+        ctx["outsider"].id,
+    }
+
+
+def test_assignable_users_sales_is_forbidden(db):
+    from app.modules.pools.service import list_assignable_users
+
+    ctx = _setup(db)
+    with pytest.raises(ForbiddenError):
+        list_assignable_users(db, ctx["sales1"])
