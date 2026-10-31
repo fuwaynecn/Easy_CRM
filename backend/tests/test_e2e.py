@@ -12,7 +12,10 @@
 7. （P2）机会从 contact 一路推到 won → 主管重开 → 标 lost，接口派生值、库里的
    终态字段、``stage_histories`` 的 from/to 序列三处必须互相对齐；
 8. （P3）写跟进（带下次待办）→ 首页今日待办 → 完成待办（回写跟进）→ 时间线两条倒序 →
-   首页清空，外加游标翻页不重不漏。
+   首页清空，外加游标翻页不重不漏；
+9. （P4）建公海客户 → 销售领取（owner/department 落地）→ 主管分配（已有 owner 记
+   ``transfer``）→ 主管释放（owner/department 双空、客户重回公海）→ 时间线三条
+   ``owner_change`` 倒序且 from/to 姓名与原因逐字段对齐。
 
 与 brief 样例的差异（样例写于早期，按现状改写）：联系人改/删走扁平
 ``PATCH|DELETE /api/v1/contacts/{id}``（嵌套写路由已删除）；``create_user`` 要求
@@ -704,3 +707,59 @@ def test_p3_follow_up_loop(client, db):
     # 第二页就是最初那条跟进：activity 主键与时间线条目的 id 同源
     assert second_body["items"][0]["id"] == activity_id
     assert second_body["items"][0]["content"] == "确认技术参数"
+
+
+def test_p4_pool_claim_assign_release_and_timeline(client, db):
+    """P4 主链路：公海列表 → 领取 → 主管分配 → 主管释放 → 时间线三条 owner_change。"""
+    f = _setup(db)
+    admin = _auth(client, "admin")
+    sales1 = _auth(client, "sales1")
+    boss = _auth(client, "boss")
+
+    pool = _create_customer(client, admin, "苏州新能源电池科技有限公司")
+
+    listed = client.get("/api/v1/pool", headers=sales1)
+    assert listed.status_code == 200, listed.text
+    assert pool["id"] in [item["id"] for item in listed.json()["items"]]
+
+    claimed = client.post(f"/api/v1/pool/{pool['id']}/claim", headers=sales1)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["owner_id"] == f["sales1"].id
+    assert claimed.json()["department_id"] == f["east"].id
+
+    assigned = client.post(
+        f"/api/v1/customers/{pool['id']}/assign",
+        headers=boss,
+        json={"owner_id": f["sales2"].id, "reason": "华东内部调整"},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["owner_id"] == f["sales2"].id
+
+    released = client.post(
+        f"/api/v1/customers/{pool['id']}/release",
+        headers=boss,
+        json={"reason": "客户长期不回复"},
+    )
+    assert released.status_code == 200, released.text
+    assert released.json()["owner_id"] is None
+    assert released.json()["department_id"] is None
+
+    listed_again = client.get("/api/v1/pool", headers=sales1)
+    assert pool["id"] in [item["id"] for item in listed_again.json()["items"]]
+
+    timeline = client.get(
+        f"/api/v1/customers/{pool['id']}/timeline", headers=boss
+    )
+    assert timeline.status_code == 200, timeline.text
+    actions = [
+        item["owner_change_action"]
+        for item in timeline.json()["items"]
+        if item["type"] == "owner_change"
+    ]
+    assert actions == ["release", "transfer", "claim"]
+    release_item = next(
+        item for item in timeline.json()["items"] if item["type"] == "owner_change"
+    )
+    assert release_item["from_owner_name"] == "王丽"
+    assert release_item["to_owner_name"] is None
+    assert release_item["content"] == "客户长期不回复"
