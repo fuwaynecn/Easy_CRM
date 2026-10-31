@@ -57,3 +57,17 @@ def test_funnel_shape_returns_decimal_strings(client, db):
     ]
     assert body["stages"][0]["count"] == 1
     assert body["stages"][0]["amount"] == "1000.00"
+
+
+def test_win_rate_shape_and_default_period(client, db):
+    _setup(db)
+    headers = _auth(_token(client, "sales_a"))
+
+    resp = client.get("/api/v1/reports/win-rate", headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total"] == 0
+    assert body["rate"] is None
+    assert body["by_department"] == []
+    assert body["date_from"] <= body["date_to"]

@@ -160,3 +160,92 @@ def test_funnel_scope_by_owner_department(db):
     assert sum(row.count for row in east.stages) == 1
     assert sum(row.count for row in south.stages) == 1
     assert sum(row.count for row in admin.stages) == 2
+
+
+from app.modules.lost_reasons.schemas import LostReasonCreate
+from app.modules.lost_reasons.service import create_lost_reason
+from app.modules.reports.service import win_rate
+
+
+def _lose(db, actor, opp, *, at: datetime, reason_id: int):
+    change_stage(
+        db, actor, opp.id, StageChange(stage="lost", lost_reason_id=reason_id)
+    )
+    # 与 _win 同理：创建 history 也要回填，避免 fixture 变成“先输单、后创建”
+    db.execute(
+        update(StageHistory)
+        .where(StageHistory.opportunity_id == opp.id)
+        .values(changed_at=at)
+    )
+    db.commit()
+
+
+def test_win_rate_uses_terminal_arrival_in_period(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    reason = create_lost_reason(db, LostReasonCreate(name="价格高"))
+    won_in = _opp(db, f["sa"], f["cust_a"], name="期内赢")
+    lost_in = _opp(db, f["sa"], f["cust_a"], name="期内输")
+    won_out = _opp(db, f["sa"], f["cust_a"], name="期外赢")
+    # 输单机会创建在区间外：如果实现把“输单时间”错写成 created_at，这条会漏掉
+    db.execute(
+        update(Opportunity)
+        .where(Opportunity.id == lost_in.id)
+        .values(created_at=datetime(2026, 9, 1, tzinfo=UTC))
+    )
+    db.commit()
+
+    _win(db, f["sa"], won_in, at=datetime(2026, 10, 15, tzinfo=UTC))
+    _lose(
+        db, f["sa"], lost_in,
+        at=datetime(2026, 10, 20, tzinfo=UTC), reason_id=reason.id,
+    )
+    _win(db, f["sa"], won_out, at=datetime(2026, 9, 30, tzinfo=UTC))
+
+    report = win_rate(db, f["admin"], period)
+
+    assert (report.won, report.lost, report.total) == (1, 1, 2)
+    assert report.rate == 50.0
+
+
+def test_win_rate_excludes_reopened_opportunity(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    opp = _opp(db, f["sa"], f["cust_a"])
+    _win(db, f["sa"], opp, at=datetime(2026, 10, 15, tzinfo=UTC))
+
+    # 重开会清空 won_at（P3 裁定），因此不再算作期内赢单
+    change_stage(db, f["boss"], opp.id, StageChange(stage="needs", note="客户反悔"))
+
+    report = win_rate(db, f["admin"], period)
+
+    assert report.won == 0
+    assert report.total == 0
+    assert report.rate is None
+
+
+def test_win_rate_groups_by_current_owner_department(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    reason = create_lost_reason(db, LostReasonCreate(name="预算取消"))
+    _win(db, f["sa"], _opp(db, f["sa"], f["cust_a"], name="华东赢"),
+         at=datetime(2026, 10, 15, tzinfo=UTC))
+    _lose(db, f["sb"], _opp(db, f["sb"], f["cust_b"], name="华南输"),
+          at=datetime(2026, 10, 16, tzinfo=UTC), reason_id=reason.id)
+
+    admin = win_rate(db, f["admin"], period)
+    east = win_rate(db, f["boss"], period)
+    south = win_rate(db, f["sb"], period)
+
+    assert admin.total == 2
+    assert {row.department_name for row in admin.by_department} == {
+        "华东销售部", "华南销售部",
+    }
+    assert (east.won, east.lost, east.rate) == (1, 0, 100.0)
+    assert (south.won, south.lost, south.rate) == (0, 1, 0.0)
