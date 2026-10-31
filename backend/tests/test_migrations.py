@@ -51,6 +51,8 @@ CHECK_CONSTRAINT_NAMES = {
     "pool_rules": {
         "ck_pool_rules_single_row",
     },
+    "owner_change_logs": {"ck_owner_change_logs_action"},
+    "audit_logs": {"ck_audit_logs_action"},
 }
 
 # CHECK 的**表达式**：``compare_metadata`` 不比 CHECK，名字断言只挡"被删/改名"。
@@ -59,6 +61,20 @@ CHECK_CONSTRAINT_DEFINITIONS = {
     "ck_activities_type": ("call", "visit", "wechat", "email", "note", "other"),
     "ck_follow_ups_status": ("pending", "done", "cancelled"),
     "ck_follow_ups_done_at_consistency": ("done", "done_at IS NOT NULL"),
+    "ck_owner_change_logs_action": [
+        "claim",
+        "recycle",
+        "assign",
+        "transfer",
+        "release",
+    ],
+    "ck_audit_logs_action": [
+        "create",
+        "delete",
+        "permission_change",
+        "transfer",
+        "import",
+    ],
 }
 
 
@@ -225,3 +241,48 @@ def test_migrated_schema_keeps_named_checks_and_column_defaults(engine: Engine) 
         assert tuple(pool_row) == (1, 30, 50, True, True, True, 3)
         with pytest.raises(IntegrityError), connection.begin_nested():
             connection.execute(text("INSERT INTO pool_rules (id) VALUES (2)"))
+
+        owner_change_id = connection.execute(
+            text(
+                "INSERT INTO owner_change_logs "
+                "(customer_id, action, to_owner_id, operator_id) "
+                "VALUES (:customer_id, 'claim', :owner_id, :owner_id) RETURNING id"
+            ),
+            {"customer_id": customer_id, "owner_id": owner_id},
+        ).scalar_one()
+        assert owner_change_id is not None
+        # 系统回收允许 operator_id 为 NULL（P4 裁定 6）
+        connection.execute(
+            text(
+                "INSERT INTO owner_change_logs "
+                "(customer_id, action, from_owner_id) "
+                "VALUES (:customer_id, 'recycle', :owner_id)"
+            ),
+            {"customer_id": customer_id, "owner_id": owner_id},
+        )
+        with pytest.raises(IntegrityError), connection.begin_nested():
+            connection.execute(
+                text(
+                    "INSERT INTO owner_change_logs (customer_id, action) "
+                    "VALUES (:customer_id, 'stolen')"
+                ),
+                {"customer_id": customer_id},
+            )
+
+        audit_id = connection.execute(
+            text(
+                "INSERT INTO audit_logs (entity, entity_id, action, before_json, after_json) "
+                "VALUES ('customers', :customer_id, 'transfer', "
+                "'{\"owner_id\": null}', '{\"owner_id\": 1}') RETURNING id"
+            ),
+            {"customer_id": customer_id},
+        ).scalar_one()
+        assert audit_id is not None
+        with pytest.raises(IntegrityError), connection.begin_nested():
+            connection.execute(
+                text(
+                    "INSERT INTO audit_logs (entity, entity_id, action) "
+                    "VALUES ('customers', :customer_id, 'hacked')"
+                ),
+                {"customer_id": customer_id},
+            )
