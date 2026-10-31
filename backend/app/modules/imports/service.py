@@ -427,7 +427,20 @@ def commit_import_job(
         db.commit()
         raise InvalidValueError("导入文件已丢失，请重新上传")
 
-    parsed = parse_customer_workbook(path.read_bytes())
+    try:
+        stored = path.read_bytes()
+        parsed = parse_customer_workbook(stored)
+    except (InvalidValueError, OSError) as exc:
+        job.status = "failed"
+        job.error_rows = 1
+        job.errors_json = [
+            ImportErrorRead(
+                row=0, column="", message="导入文件已损坏或无法读取，请重新上传"
+            ).model_dump()
+        ]
+        db.commit()
+        raise InvalidValueError("导入文件已损坏或无法读取，请重新上传") from exc
+
     result = validate_customer_rows(db, actor, parsed.rows)
     errors = [*parsed.errors, *result.errors]
     job.total_rows = parsed.total_rows

@@ -6,6 +6,7 @@
 
 from io import BytesIO
 
+import pytest
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import func, select
 
@@ -319,11 +320,28 @@ def test_commit_creates_customers_and_single_audit(client, db):
     ).scalars().all()
     assert len(customers) == 2
     assert {customer.owner_id for customer in customers} == {f["sa"].id, f["sb"].id}
+    # 只断言名字不够：整行字段或部门/创建人错位照样会“绿”，但客户数据已写坏
+    by_name = {customer.name: customer for customer in customers}
+    assert by_name["甲制造有限公司"].industry == "制造业"
+    assert by_name["甲制造有限公司"].level == "A"
+    assert {customer.department_id for customer in customers} == {
+        f["sa"].department_id,
+        f["sb"].department_id,
+    }
+    assert {customer.created_by for customer in customers} == {f["admin"].id}
     logs = db.execute(
         select(AuditLog).where(AuditLog.entity == "imports", AuditLog.action == "import")
     ).scalars().all()
     assert len(logs) == 1
     assert logs[0].entity_id == created["id"]
+    # 审计快照是事后追溯的唯一证据，字段错位等于审计失效
+    assert logs[0].after_json == {
+        "kind": "customers",
+        "file_name": "customers.xlsx",
+        "total_rows": 2,
+        "success_rows": 2,
+        "skipped_rows": 0,
+    }
 
 
 def test_commit_skips_duplicate_created_after_upload(client, db):
@@ -384,7 +402,10 @@ def test_commit_rejects_failed_or_done_job(client, db):
     )
 
     assert failed_resp.status_code == 400
+    # 两个 400 的原因必须可区分：failed 任务要修正后重传，done 任务不该再点
+    assert failed_resp.json()["message"] == "校验未通过，请修正后重新上传"
     assert again_resp.status_code == 400
+    assert again_resp.json()["message"] == "该导入任务已完成"
 
 
 def test_commit_in_file_duplicate_writes_one(client, db):
@@ -411,3 +432,49 @@ def test_commit_in_file_duplicate_writes_one(client, db):
         .where(Customer.name == "甲制造有限公司")
     ).scalar_one() == 1
     assert db.execute(select(Customer.name)).scalars().all() == ["甲制造有限公司"]
+
+
+def test_commit_marks_failed_when_stored_file_corrupt(client, db, tmp_path):
+    """落盘文件损坏：必须把 job 标 failed 并回 400，而不是 500 后留在 validated。"""
+    _setup(db)
+    body = _upload(
+        client, _token(client, "admin"), _xlsx([_row("甲制造有限公司")])
+    ).json()
+    (tmp_path / "imports" / f"{body['id']}.xlsx").write_bytes(b"not an xlsx")
+
+    resp = client.post(
+        f"/api/v1/imports/{body['id']}/commit", headers=_auth(_token(client, "admin"))
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "invalid_value"
+    job = db.get(ImportJob, body["id"])
+    assert job.status == "failed"
+    assert job.error_rows == 1
+    assert job.errors_json[0]["row"] == 0
+    assert job.errors_json[0]["message"] == "导入文件已损坏或无法读取，请重新上传"
+    assert db.scalar(select(func.count()).select_from(Customer)) == 0
+
+
+def test_commit_rolls_back_on_audit_failure(client, db, monkeypatch):
+    """审计写失败：客户与审计整体回滚，再用独立事务把 job 标 failed。"""
+    f = _setup(db)
+    body = _upload(
+        client, _token(client, "admin"), _xlsx([_row("甲制造有限公司")])
+    ).json()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("audit boom")
+
+    monkeypatch.setattr("app.modules.imports.service.write_audit_log", boom)
+
+    with pytest.raises(RuntimeError):
+        commit_import_job(db, f["admin"], body["id"])
+
+    job = db.get(ImportJob, body["id"])
+    assert job.status == "failed"
+    assert job.error_rows == 1
+    assert job.errors_json[0]["message"] == "写入失败，已整体回滚"
+    # 没有审计就是没有写入：客户与 audit_logs 都必须为空
+    assert db.scalar(select(func.count()).select_from(Customer)) == 0
+    assert db.scalar(select(func.count()).select_from(AuditLog)) == 0
