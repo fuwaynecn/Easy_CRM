@@ -10,6 +10,7 @@ import CustomerListPage from "./pages/CustomerListPage";
 import HomePage from "./pages/HomePage";
 import LoginPage from "./pages/LoginPage";
 import OpportunityBoardPage from "./pages/OpportunityBoardPage";
+import OpportunityDetailPage from "./pages/OpportunityDetailPage";
 import OpportunityListPage from "./pages/OpportunityListPage";
 
 const queryClient = new QueryClient({
@@ -83,6 +84,16 @@ export default function App() {
                 <RequireAuth>
                   <AppShell>
                     <OpportunityBoardPage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/opportunities/:id"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <OpportunityDetailPage />
                   </AppShell>
                 </RequireAuth>
               }
