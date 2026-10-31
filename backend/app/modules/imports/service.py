@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import InvalidValueError, NotFoundError
+from app.modules.audit.service import write_audit_log
 from app.modules.customers.models import Customer
 from app.modules.customers.service import normalize_name
 from app.modules.imports.models import ImportJob
@@ -402,6 +403,90 @@ def create_import_job(
     job.errors_json = [error.model_dump() for error in errors] or None
     job.status = "validated" if not errors else "failed"
     db.commit()
+    db.refresh(job)
+    return job
+
+
+def commit_import_job(
+    db: Session, actor: User, job_id: int
+) -> ImportJob:
+    """确认写入：重新解析校验，单事务建客户，失败整体回滚。"""
+    job = get_import_job(db, actor, job_id)
+    if job.status == "done":
+        raise InvalidValueError("该导入任务已完成")
+    if job.status != "validated":
+        raise InvalidValueError("校验未通过，请修正后重新上传")
+
+    path = _job_path(job.id)
+    if not path.exists():
+        job.status = "failed"
+        job.error_rows = 1
+        job.errors_json = [
+            {"row": 0, "column": "", "message": "导入文件已丢失，请重新上传"}
+        ]
+        db.commit()
+        raise InvalidValueError("导入文件已丢失，请重新上传")
+
+    parsed = parse_customer_workbook(path.read_bytes())
+    result = validate_customer_rows(db, actor, parsed.rows)
+    errors = [*parsed.errors, *result.errors]
+    job.total_rows = parsed.total_rows
+    job.skipped_rows = len(result.skipped)
+    job.error_rows = len({error.row for error in errors})
+
+    if errors:
+        job.status = "failed"
+        job.errors_json = [error.model_dump() for error in errors]
+        db.commit()
+        raise InvalidValueError("校验未通过，未写入任何客户")
+
+    try:
+        for row in result.valid:
+            owner = db.execute(
+                select(User).where(User.username == row.owner_username)
+            ).scalar_one()
+            db.add(
+                Customer(
+                    name=row.name,
+                    owner_id=owner.id,
+                    department_id=owner.department_id,
+                    created_by=actor.id,
+                    last_activity_at=None,
+                    **row.fields,
+                )
+            )
+        job.status = "done"
+        job.success_rows = len(result.valid)
+        job.error_rows = 0
+        job.errors_json = None
+        write_audit_log(
+            db,
+            entity="imports",
+            entity_id=job.id,
+            action="import",
+            before=None,
+            after={
+                "kind": job.kind,
+                "file_name": job.file_name,
+                "total_rows": job.total_rows,
+                "success_rows": job.success_rows,
+                "skipped_rows": job.skipped_rows,
+            },
+            operator_id=actor.id,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        # 回滚后 job 的状态也回到 validated；用一条独立事务记失败，避免“明明失败却显示可重试”
+        job = db.get(ImportJob, job_id)
+        if job is not None:
+            job.status = "failed"
+            job.error_rows = 1
+            job.errors_json = [
+                {"row": 0, "column": "", "message": "写入失败，已整体回滚"}
+            ]
+            db.commit()
+        raise
     db.refresh(job)
     return job
 

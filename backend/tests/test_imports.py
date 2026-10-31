@@ -9,14 +9,17 @@ from io import BytesIO
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import func, select
 
+from app.modules.audit.models import AuditLog
 from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
 from app.modules.customers.service import create_customer
 from app.modules.departments.service import create_department
+from app.modules.imports.models import ImportJob
 from app.modules.imports.service import (
     CUSTOMER_TEMPLATE_COLUMNS,
     ParsedCustomerRow,
     build_customer_template,
+    commit_import_job,
     validate_customer_rows,
 )
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
@@ -289,3 +292,122 @@ def test_template_endpoint_requires_manager_and_customers_kind(client, db):
     assert sales.status_code == 403
     assert contacts.status_code == 400
     assert contacts.json()["code"] == "invalid_value"
+
+
+def test_commit_creates_customers_and_single_audit(client, db):
+    f = _setup(db)
+    content = _xlsx([
+        # `_row` 只认模板里的中文列名；brief 这里写的是 `industry=`/`level=`，会 KeyError
+        _row("甲制造有限公司", 行业="制造业", 等级="A"),
+        _row("乙贸易有限公司", owner="sales_b"),
+    ])
+    created = _upload(client, _token(client, "admin"), content).json()
+
+    resp = client.post(
+        f"/api/v1/imports/{created['id']}/commit",
+        headers=_auth(_token(client, "admin")),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "done"
+    assert body["success_rows"] == 2
+    assert body["error_rows"] == 0
+    assert body["errors"] == []
+    customers = db.execute(
+        select(Customer).where(Customer.name.in_(["甲制造有限公司", "乙贸易有限公司"]))
+    ).scalars().all()
+    assert len(customers) == 2
+    assert {customer.owner_id for customer in customers} == {f["sa"].id, f["sb"].id}
+    logs = db.execute(
+        select(AuditLog).where(AuditLog.entity == "imports", AuditLog.action == "import")
+    ).scalars().all()
+    assert len(logs) == 1
+    assert logs[0].entity_id == created["id"]
+
+
+def test_commit_skips_duplicate_created_after_upload(client, db):
+    f = _setup(db)
+    content = _xlsx([_row("甲制造有限公司")])
+    created = _upload(client, _token(client, "boss"), content).json()
+    create_customer(db, f["sa"], CustomerCreate(name="甲制造有限公司"))
+
+    commit_import_job(db, f["boss"], created["id"])
+
+    job = db.get(ImportJob, created["id"])
+    assert job.status == "done"
+    assert job.success_rows == 0
+    assert job.skipped_rows == 1
+    assert db.execute(
+        select(func.count()).select_from(Customer).where(Customer.name == "甲制造有限公司")
+    ).scalar_one() == 1
+
+
+def test_commit_revalidates_owner_and_writes_nothing(client, db):
+    f = _setup(db)
+    content = _xlsx([_row("甲制造有限公司")])
+    created = _upload(client, _token(client, "boss"), content).json()
+    # 上传后负责人被停用：commit 必须重新校验并整体放弃
+    from sqlalchemy import update
+
+    from app.modules.users.models import User
+    db.execute(update(User).where(User.id == f["sa"].id).values(status="disabled"))
+    db.commit()
+
+    resp = client.post(
+        f"/api/v1/imports/{created['id']}/commit",
+        headers=_auth(_token(client, "boss")),
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == "invalid_value"
+    assert db.execute(
+        select(func.count()).select_from(Customer).where(Customer.name == "甲制造有限公司")
+    ).scalar_one() == 0
+
+
+def test_commit_rejects_failed_or_done_job(client, db):
+    f = _setup(db)
+    bad = _upload(
+        client, _token(client, "boss"), _xlsx([_row("甲制造有限公司", owner="ghost")])
+    ).json()
+    good = _upload(
+        client, _token(client, "boss"), _xlsx([_row("乙贸易有限公司")])
+    ).json()
+    commit_import_job(db, f["boss"], good["id"])
+
+    failed_resp = client.post(
+        f"/api/v1/imports/{bad['id']}/commit", headers=_auth(_token(client, "boss"))
+    )
+    again_resp = client.post(
+        f"/api/v1/imports/{good['id']}/commit", headers=_auth(_token(client, "boss"))
+    )
+
+    assert failed_resp.status_code == 400
+    assert again_resp.status_code == 400
+
+
+def test_commit_in_file_duplicate_writes_one(client, db):
+    """同一文件内重名：只写一条客户，另一条进 skipped。"""
+    _setup(db)
+    content = _xlsx([_row("甲制造有限公司"), _row("甲制造有限公司 ")])
+    uploaded = _upload(client, _token(client, "admin"), content)
+    assert uploaded.status_code == 201, uploaded.text
+    body = uploaded.json()
+    assert body["skipped_rows"] == 1
+
+    resp = client.post(
+        f"/api/v1/imports/{body['id']}/commit",
+        headers=_auth(_token(client, "admin")),
+    )
+
+    assert resp.status_code == 200, resp.text
+    committed = resp.json()
+    assert committed["success_rows"] == 1
+    assert committed["skipped_rows"] == 1
+    assert db.execute(
+        select(func.count())
+        .select_from(Customer)
+        .where(Customer.name == "甲制造有限公司")
+    ).scalar_one() == 1
+    assert db.execute(select(Customer.name)).scalars().all() == ["甲制造有限公司"]

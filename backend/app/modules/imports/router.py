@@ -17,6 +17,7 @@ from app.modules.imports.schemas import ImportJobRead
 from app.modules.imports.service import (
     MAX_IMPORT_BYTES,
     build_customer_template,
+    commit_import_job,
     create_import_job,
     get_import_job,
 )
@@ -70,3 +71,12 @@ def read_import(
     user: ManagerOrAdminUser,
 ):
     return get_import_job(db, user, job_id)
+
+
+@router.post("/{job_id}/commit", response_model=ImportJobRead)
+def commit_import(
+    job_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    user: ManagerOrAdminUser,
+):
+    return commit_import_job(db, user, job_id)
