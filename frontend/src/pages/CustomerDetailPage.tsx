@@ -12,12 +12,14 @@ import type { Contact, Customer, FollowUp } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
 import { ActivityFormModal } from "../components/ActivityFormModal";
 import type { ActivityDraft } from "../components/ActivityFormModal";
+import { AssignCustomerModal } from "../components/AssignCustomerModal";
 import { Field, TextArea } from "../components/Field";
 import { FollowUpDoneModal } from "../components/FollowUpDoneModal";
 import { FollowUpFormModal } from "../components/FollowUpFormModal";
 import { Modal } from "../components/Modal";
 import { OpportunityFormModal } from "../components/OpportunityFormModal";
 import { QueryError } from "../components/QueryError";
+import { ReleaseCustomerModal } from "../components/ReleaseCustomerModal";
 import { Timeline } from "../components/Timeline";
 import {
   BUDGET_STATUS_LABELS,
@@ -161,6 +163,8 @@ export default function CustomerDetailPage() {
   const [deleteTarget, setDeleteTarget] = useState<Contact | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [showOpportunityForm, setShowOpportunityForm] = useState(false);
+  const [assignOpen, setAssignOpen] = useState(false);
+  const [releaseOpen, setReleaseOpen] = useState(false);
 
   const customerQuery = useQuery({
     queryKey: ["customer", customerId],
@@ -376,6 +380,14 @@ export default function CustomerDetailPage() {
   const publicPool = customer.owner_id === null;
   const writable = !publicPool || user?.role === "admin";
 
+  // 分配权限：admin 全公司；manager 只能本部门（公海客户无部门，故不能分配）。
+  const canManageOwner =
+    user?.role === "admin" ||
+    (user?.role === "manager" &&
+      !publicPool &&
+      customer.department_id !== null &&
+      customer.department_id === user.department_id);
+
   // 负责人姓名：CustomerRead 现已带 owner_name（后端回填负责人 display_name），
   // 公海客户的 owner_id / owner_name 同为 null。判定仍以 owner_id 为准，与列表页
   // 徽标、下面的 writable 用同一个口径；owner_name 缺失时退回 id，绝不显示「用户 #null」。
@@ -441,6 +453,27 @@ export default function CustomerDetailPage() {
               </span>
             )}
           </div>
+
+          {canManageOwner ? (
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setAssignOpen(true)}
+                className="rounded-md border border-slate-300 px-2.5 py-1 text-sm hover:bg-slate-100"
+              >
+                分配
+              </button>
+              {!publicPool ? (
+                <button
+                  type="button"
+                  onClick={() => setReleaseOpen(true)}
+                  className="rounded-md border border-red-300 px-2.5 py-1 text-sm text-red-700 hover:bg-red-50"
+                >
+                  释放回公海
+                </button>
+              ) : null}
+            </div>
+          ) : null}
 
           {publicPool && !writable ? (
             <p className="break-words text-xs text-amber-700">
@@ -877,6 +910,28 @@ export default function CustomerDetailPage() {
           onSubmit={(createActivity, activityType) =>
             completeTodo.mutate({ id: doneTarget.id, createActivity, activityType })
           }
+        />
+      ) : null}
+
+      {assignOpen ? (
+        <AssignCustomerModal
+          customerId={customer.id}
+          currentOwnerId={customer.owner_id}
+          onClose={() => setAssignOpen(false)}
+          onDone={() => setAssignOpen(false)}
+        />
+      ) : null}
+
+      {releaseOpen ? (
+        <ReleaseCustomerModal
+          customerId={customer.id}
+          customerName={customer.name}
+          onClose={() => setReleaseOpen(false)}
+          onDone={() => {
+            setReleaseOpen(false);
+            setEditing(false);
+            setSaved(false);
+          }}
         />
       ) : null}
 
