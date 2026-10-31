@@ -25,6 +25,9 @@ from app.modules.reports.schemas import (
     DepartmentRateRead,
     FunnelReport,
     FunnelStageRead,
+    PerformanceMonthRead,
+    PerformanceOwnerRead,
+    PerformanceReport,
     WinRateReport,
 )
 from app.modules.users.models import User
@@ -193,4 +196,78 @@ def cycle(db: Session, actor: User, period: Period) -> CycleReport:
             )
             for row in month_rows
         ],
+    )
+
+
+def performance(db: Session, actor: User, period: Period) -> PerformanceReport:
+    """期间赢单金额：按机会负责人与月份分组。
+
+    金额取最后一条 `to_stage='won'` 的 `amount_snapshot`；没有赢单历史的脏数据
+    才回落到机会现值。
+    """
+    won_hist = latest_stage_subquery(to_stage="won")
+    amount = func.coalesce(won_hist.c.amount_snapshot, Opportunity.amount)
+    base = [
+        *opportunity_scope_conditions(actor),
+        Opportunity.stage == "won",
+        Opportunity.won_at >= period.start,
+        Opportunity.won_at < period.end,
+    ]
+    owner_rows = db.execute(
+        select(
+            User.id,
+            User.display_name,
+            func.count().label("won_count"),
+            func.coalesce(func.sum(amount), 0).label("amount"),
+        )
+        .select_from(Opportunity)
+        .join(User, User.id == Opportunity.owner_id)
+        .outerjoin(
+            won_hist,
+            and_(won_hist.c.opportunity_id == Opportunity.id, won_hist.c.rn == 1),
+        )
+        .where(*base)
+        .group_by(User.id, User.display_name)
+        .order_by(User.display_name.asc(), User.id.asc())
+    ).all()
+    month = month_bucket(Opportunity.won_at)
+    month_rows = db.execute(
+        select(
+            month.label("month"),
+            func.count().label("won_count"),
+            func.coalesce(func.sum(amount), 0).label("amount"),
+        )
+        .select_from(Opportunity)
+        .outerjoin(
+            won_hist,
+            and_(won_hist.c.opportunity_id == Opportunity.id, won_hist.c.rn == 1),
+        )
+        .where(*base)
+        .group_by(month)
+        .order_by(month.asc())
+    ).all()
+    by_owner = [
+        PerformanceOwnerRead(
+            owner_id=row.id,
+            owner_name=row.display_name,
+            won_count=int(row.won_count),
+            amount=Decimal(row.amount),
+        )
+        for row in owner_rows
+    ]
+    by_month = [
+        PerformanceMonthRead(
+            month=row.month,
+            won_count=int(row.won_count),
+            amount=Decimal(row.amount),
+        )
+        for row in month_rows
+    ]
+    return PerformanceReport(
+        date_from=period.date_from,
+        date_to=period.date_to,
+        won_count=sum(row.won_count for row in by_owner),
+        total_amount=sum((row.amount for row in by_owner), Decimal(0)),
+        by_owner=by_owner,
+        by_month=by_month,
     )

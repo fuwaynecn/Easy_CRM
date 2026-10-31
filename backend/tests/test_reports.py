@@ -295,3 +295,47 @@ def test_cycle_month_bucket_uses_shanghai_timezone(db):
     report = cycle(db, f["admin"], period)
 
     assert [row.month for row in report.by_month] == ["2026-10", "2026-11"]
+
+
+from app.modules.reports.service import performance
+
+
+def test_performance_uses_won_snapshot_amount(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    opp = _opp(db, f["sa"], f["cust_a"], amount="1000.00")
+    _win(db, f["sa"], opp, at=datetime(2026, 10, 15, tzinfo=UTC))
+    # 赢单后改金额：报表仍按赢单时点的快照
+    update_opportunity(
+        db, f["sa"], opp.id, OpportunityUpdate(amount=Decimal("9999.00"))
+    )
+
+    report = performance(db, f["admin"], period)
+
+    assert report.won_count == 1
+    assert report.total_amount == Decimal("1000.00")
+    assert report.by_owner[0].amount == Decimal("1000.00")
+    assert report.by_month[0].month == "2026-10"
+
+
+def test_performance_groups_by_owner_and_month(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    _win(db, f["sa"], _opp(db, f["sa"], f["cust_a"], name="A1", amount="100.00"),
+         at=datetime(2026, 10, 10, tzinfo=UTC))
+    _win(db, f["sb"], _opp(db, f["sb"], f["cust_b"], name="B1", amount="200.00"),
+         at=datetime(2026, 10, 11, tzinfo=UTC))
+
+    admin = performance(db, f["admin"], period)
+    east = performance(db, f["boss"], period)
+
+    assert admin.total_amount == Decimal("300.00")
+    assert {row.owner_name: row.amount for row in admin.by_owner} == {
+        "销售A": Decimal("100.00"),
+        "销售B": Decimal("200.00"),
+    }
+    assert east.total_amount == Decimal("100.00")

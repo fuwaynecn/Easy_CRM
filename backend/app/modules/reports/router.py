@@ -9,8 +9,13 @@ from sqlalchemy.orm import Session
 from app.core.deps import CurrentUser
 from app.db.session import get_db
 from app.modules.reports.common import resolve_period
-from app.modules.reports.schemas import CycleReport, FunnelReport, WinRateReport
-from app.modules.reports.service import cycle, funnel, win_rate
+from app.modules.reports.schemas import (
+    CycleReport,
+    FunnelReport,
+    PerformanceReport,
+    WinRateReport,
+)
+from app.modules.reports.service import cycle, funnel, performance, win_rate
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -41,3 +46,13 @@ def get_cycle(
     date_to: date | None = None,
 ):
     return cycle(db, user, resolve_period(date_from, date_to))
+
+
+@router.get("/performance", response_model=PerformanceReport)
+def get_performance(
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+    date_from: date | None = None,
+    date_to: date | None = None,
+):
+    return performance(db, user, resolve_period(date_from, date_to))
