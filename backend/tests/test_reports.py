@@ -32,7 +32,7 @@ from app.modules.opportunities.service import (
     update_opportunity,
 )
 from app.modules.reports.common import resolve_period
-from app.modules.reports.service import activities, funnel
+from app.modules.reports.service import activities, competitors, funnel
 from app.modules.reports.service import lost_reasons as lost_reason_report
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
@@ -477,3 +477,29 @@ def test_lost_reasons_period_uses_lost_history_time(db):
     report = lost_reason_report(db, f["admin"], period)
 
     assert report.total_count == 1
+
+
+def test_competitors_splits_by_dunhao_and_counts_win_rate(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    reason = create_lost_reason(db, LostReasonCreate(name="价格高"))
+    a = _opp(db, f["sa"], f["cust_a"], name="A", competitor="西门子、ABB", amount="100.00")
+    b = _opp(db, f["sa"], f["cust_a"], name="B", competitor="西门子", amount="200.00")
+    _set_created_at(db, a, datetime(2026, 10, 5, tzinfo=UTC))
+    _set_created_at(db, b, datetime(2026, 10, 6, tzinfo=UTC))
+    _win(db, f["sa"], a, at=datetime(2026, 10, 10, tzinfo=UTC))
+    _lose(db, f["sa"], b, at=datetime(2026, 10, 11, tzinfo=UTC), reason_id=reason.id)
+
+    report = competitors(db, f["admin"], period)
+
+    assert report.total_opportunities == 2
+    by_name = {row.competitor: row for row in report.items}
+    assert by_name["西门子"].count == 2
+    assert by_name["西门子"].won == 1
+    assert by_name["西门子"].lost == 1
+    assert by_name["西门子"].rate == 50.0
+    assert by_name["ABB"].count == 1
+    assert by_name["ABB"].won == 1
+    assert by_name["ABB"].rate == 100.0

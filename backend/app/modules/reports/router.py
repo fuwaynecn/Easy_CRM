@@ -11,6 +11,7 @@ from app.db.session import get_db
 from app.modules.reports.common import resolve_period
 from app.modules.reports.schemas import (
     ActivityReport,
+    CompetitorReport,
     CycleReport,
     FunnelReport,
     LostReasonReport,
@@ -19,6 +20,7 @@ from app.modules.reports.schemas import (
 )
 from app.modules.reports.service import (
     activities,
+    competitors,
     cycle,
     funnel,
     lost_reasons,
@@ -88,3 +90,13 @@ def get_lost_reasons(
     date_to: date | None = None,
 ):
     return lost_reasons(db, user, resolve_period(date_from, date_to))
+
+
+@router.get("/competitors", response_model=CompetitorReport)
+def get_competitors(
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+    date_from: date | None = None,
+    date_to: date | None = None,
+):
+    return competitors(db, user, resolve_period(date_from, date_to))

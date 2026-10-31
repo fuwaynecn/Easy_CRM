@@ -29,6 +29,8 @@ from app.modules.reports.schemas import (
     ActivityBucketRead,
     ActivityOwnerRead,
     ActivityReport,
+    CompetitorRead,
+    CompetitorReport,
     CycleMonthRead,
     CycleOwnerRead,
     CycleReport,
@@ -195,6 +197,73 @@ def lost_reasons(db: Session, actor: User, period: Period) -> LostReasonReport:
         date_to=period.date_to,
         total_count=sum(item.count for item in items),
         total_amount=sum((item.amount for item in items), Decimal(0)),
+        items=items,
+    )
+
+
+def competitors(
+    db: Session, actor: User, period: Period
+) -> CompetitorReport:
+    """竞争对手：期间**新建**机会按 `competitor` 文本拆分。
+
+    拆分只按 spec 写的顿号「、」；同一机会里重复的对手去重。一个机会多个对手时
+    分别计入，因此条数与金额合计都可能大于机会总数——这是口径，不是重复计算 bug。
+    """
+    latest = latest_stage_subquery()
+    amount = func.coalesce(latest.c.amount_snapshot, Opportunity.amount)
+    rows = db.execute(
+        select(
+            Opportunity.id,
+            Opportunity.competitor,
+            Opportunity.stage,
+            amount.label("amount"),
+        )
+        .select_from(Opportunity)
+        .outerjoin(
+            latest,
+            and_(latest.c.opportunity_id == Opportunity.id, latest.c.rn == 1),
+        )
+        .where(
+            *opportunity_scope_conditions(actor),
+            Opportunity.competitor.is_not(None),
+            Opportunity.created_at >= period.start,
+            Opportunity.created_at < period.end,
+        )
+    ).all()
+    stats: dict[str, dict] = {}
+    opportunities = 0
+    for row in rows:
+        names = {part.strip() for part in row.competitor.split("、") if part.strip()}
+        if not names:
+            continue
+        opportunities += 1
+        for name in names:
+            item = stats.setdefault(
+                name,
+                {"count": 0, "amount": Decimal(0), "won": 0, "lost": 0},
+            )
+            item["count"] += 1
+            item["amount"] += Decimal(row.amount)
+            if row.stage == "won":
+                item["won"] += 1
+            elif row.stage == "lost":
+                item["lost"] += 1
+    items = [
+        CompetitorRead(
+            competitor=name,
+            count=item["count"],
+            amount=item["amount"],
+            won=item["won"],
+            lost=item["lost"],
+            rate=_rate(item["won"], item["lost"]),
+        )
+        for name, item in stats.items()
+    ]
+    items.sort(key=lambda row: (-row.count, row.competitor))
+    return CompetitorReport(
+        date_from=period.date_from,
+        date_to=period.date_to,
+        total_opportunities=opportunities,
         items=items,
     )
 
