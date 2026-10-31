@@ -257,7 +257,11 @@ def test_home_block_limit_truncates(db):
 
 def test_home_api_shape(client, db):
     f = _setup(db)
-    _todo(db, f["sa"], f["cust_a"], due_at=NOW, content="今天的待办")
+    # 走真实 HTTP，服务端用真实当前时间；这里必须写"上海今天"，不能固定 2026-10-31。
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).replace(
+        hour=1, minute=0, second=0, microsecond=0
+    )
+    _todo(db, f["sa"], f["cust_a"], due_at=today, content="今天的待办")
     login = client.post(
         "/api/v1/auth/login", json={"username": "sales_a", "password": PASSWORD}
     )
