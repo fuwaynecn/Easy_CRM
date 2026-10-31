@@ -21,6 +21,7 @@ from app.modules.home.router import router as home_router
 from app.modules.lost_reasons.router import router as lost_reasons_router
 from app.modules.opportunities.router import router as opportunities_router
 from app.modules.pools.router import router as pools_router
+from app.modules.reports.router import router as reports_router
 from app.modules.timeline.router import router as timeline_router
 from app.modules.users.router import router as users_router
 from app.scheduler import shutdown_scheduler, start_scheduler
@@ -160,6 +161,7 @@ def create_app() -> FastAPI:
     app.include_router(opportunities_router, prefix="/api/v1")
     app.include_router(home_router, prefix="/api/v1")
     app.include_router(pools_router, prefix="/api/v1")
+    app.include_router(reports_router, prefix="/api/v1")
 
     return app
 
