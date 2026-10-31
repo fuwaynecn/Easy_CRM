@@ -18,6 +18,8 @@ dependencies = [
     # python:3.x-slim 这类镜像不带系统时区库，缺失时 ZoneInfo 会抛异常。
     "tzdata>=2024.1",
     "apscheduler>=3.10,<4",
+    "openpyxl>=3.1",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]

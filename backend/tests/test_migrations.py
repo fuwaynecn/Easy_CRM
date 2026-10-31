@@ -53,6 +53,7 @@ CHECK_CONSTRAINT_NAMES = {
     },
     "owner_change_logs": {"ck_owner_change_logs_action"},
     "audit_logs": {"ck_audit_logs_action"},
+    "import_jobs": {"ck_import_jobs_kind", "ck_import_jobs_status"},
 }
 
 # CHECK 的**表达式**：``compare_metadata`` 不比 CHECK，名字断言只挡"被删/改名"。
@@ -75,6 +76,10 @@ CHECK_CONSTRAINT_DEFINITIONS = {
         "transfer",
         "import",
     ],
+    "ck_import_jobs_kind": ("customers", "contacts", "opportunities"),
+    "ck_import_jobs_status": (
+        "validating", "validated", "importing", "done", "failed",
+    ),
 }
 
 

@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     environment: str = "dev"
     scheduler_enabled: bool = True
     scheduler_timezone: str = "Asia/Shanghai"
+    # 导入文件落盘目录；相对路径按 backend 工作目录解析。P6 Docker 里挂 volume。
+    import_dir: str = "data/imports"
 
 
 settings = Settings()

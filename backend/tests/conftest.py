@@ -88,3 +88,8 @@ def client(db: Session) -> Iterator[TestClient]:
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_import_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "import_dir", str(tmp_path / "imports"))
