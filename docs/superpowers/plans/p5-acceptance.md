@@ -38,7 +38,7 @@ P4 基线 **652**（`p4-acceptance.md` §1）→ 当前 **695 收集**，P5 净�
 | `tests/test_e2e.py` 新增（本次 Task 13） | 2 |
 | **合计** | **43** |
 
-计划里「P4 基线 652 + 报表 24 + 导入 17 + E2E 2 = 695」与实际收集数一致；最终全量为 **695 passed**（见 §1.2 的修复记录）。
+本 brief 的估算「P4 基线 652 + 报表 24 + 导入 17 + E2E 2 = 695」与实际收集数一致；最终全量为 **695 passed**（见 §1.2 的修复记录）。
 
 ### 1.2 全量中出现过的 P3 时间炸弹（已修复，非 P5）
 
@@ -63,7 +63,7 @@ assert [] == ['今天的待办']
 ## 2. 报表口径对账（自动化，非另起手工数据集）
 
 本节**不是**另准备一套手工数据，而是对 `backend/tests/test_reports.py` 里既有的确定性夹具
-断言逐项抄录：一个部门（华东销售部）、两名销售（销售A / 销售B）、受控机会；夹具时间基准
+断言逐项抄录：两个部门（华东销售部 / 华南销售部）、两名销售（销售A 在华东、销售B 在华南）、受控机会；夹具时间基准
 `NOW = 2026-10-31 15:00 UTC`（上海 23:00）；除注明外区间 `2026-10-01..2026-10-31`。
 这些断言在真实 PostgreSQL 上执行；报表 service 与 HTTP 端点共用同一实现（`reports/router.py`
 只是 `resolve_period` + 调 service），因此「页面/接口实际」就是同一条断言的通过结果。
@@ -92,20 +92,20 @@ assert [] == ['今天的待办']
 ## 3. 导入验收
 
 逐项证据取自 `backend/tests/test_imports.py`（17 条）与 `backend/tests/test_e2e.py`（2 条），
-外加 Task 12 的浏览器运行时记录（2026-11-01）。
+外加控制端浏览器运行时记录（2026-11-01；实现者未开浏览器）。
 
 - [x] **模板可下载、Excel 可打开，表头/示例/说明齐全**：运行时 `/import` 真下载到
-  `customers-template.xlsx` 6,349 字节（Task 12，2026-11-01，375px 窗口）；自动化
-  `test_template_has_headers_example_and_guide`（两个 sheet `客户` / `填写说明`、15 列表头、
-  示例行 `杭州示例科技有限公司` / `sales1`）、`test_template_endpoint_requires_manager_and_customers_kind`
+  `customers-template.xlsx` 6,349 字节（控制端浏览器实测，2026-11-01，375px 窗口）；自动化
+  `test_template_has_headers_example_and_guide`（两个 sheet `客户` / `填写说明`、表头等于
+  `CUSTOMER_TEMPLATE_COLUMNS`（15 列）、示例行 `杭州示例科技有限公司` / `sales1`）、
+  `test_template_endpoint_requires_manager_and_customers_kind`
   （manager 200 + xlsx content-type；sales 403；`contacts` 400）。
 - [x] **3 行合法文件：校验通过 → 确认写入 → 客户列表可见**：运行时 admin 上传 2 行走通
-  `validated → done success 2`（Task 12，2026-11-01）；E2E `test_p5_import_then_report_e2e`
+  `validated → done success 2`（控制端浏览器实测，2026-11-01）；E2E `test_p5_import_then_report_e2e`
   导入 3 行 → `success_rows=3` → `GET /customers?keyword=E2E` `total=3` → 建机会 → 漏斗可见；
   自动化 `test_commit_creates_customers_and_single_audit`（2 行，逐字段/部门/创建人）。
-- [x] **500 行文件：一次导入成功**：`test_p5_import_500_rows` PASS，单独运行 **1.42s**
-  （`pytest tests/test_e2e.py::test_p5_import_500_rows -q`；上传 `total_rows=500`、`error_rows=0`，
-  commit `success_rows=500`）。
+- [x] **500 行文件：一次导入成功**：`test_p5_import_500_rows` PASS（包含在 E2E 单文件
+  16 passed / 12.43s 内；上传 `total_rows=500`、`error_rows=0`，commit `success_rows=500`）。
 - [x] **重名（含空格/全半角差异）跳过，不覆盖，不计错误**：`test_upload_duplicate_name_is_skipped_not_error`、
   `test_validate_existing_duplicate_stays_out_of_valid`（尾随空格，命中 `normalize_name`）、
   `test_validate_in_file_duplicate_keeps_one_valid`（文件内同名）、`test_commit_in_file_duplicate_writes_one`
@@ -115,7 +115,8 @@ assert [] == ['今天的待办']
   `test_customers.py::test_create_customer_rejects_full_width_duplicate` 钉住；导入侧沿用同一函数，
   **导入路径下的全角变体没有独立用例**，已覆盖的是尾随空格变体。
 - [x] **未知负责人：行号 + 列名 + 原因，整体不写入**：`test_upload_unknown_owner_is_row_error`
-  （`status=failed`、`errors[0].row=2`、`column="负责人*"`、消息含 `ghost`），上传阶段不写客户。
+  （`status=failed`、`errors[0].row=2`、`column="负责人*"`、消息含 `ghost`）；上传阶段不写客户由
+  `test_upload_valid_rows_creates_validated_job` 的 `Customer` 计数 0 钉住。
 - [x] **manager 导其他部门负责人：报错，不写入**：`test_upload_manager_cannot_use_other_department_owner`
   （`status=failed`，消息含「本部门」）；服务层判定在 `validate_customer_rows`
   （`actor.role == manager and owner.department_id != actor.department_id`）。
@@ -144,15 +145,15 @@ assert [] == ['今天的待办']
 
 - [x] **公海 / 分配释放弹窗 / 规则表单 375px 无横向溢出**：P4 `p4-acceptance.md` §2-F，
   Wayne 2026-10-31 实测通过。
-- [x] **`/reports` 375px 无横向溢出、表格内部滚动**：Task 8 运行时（2026-11-01）：七个报表接口
+- [x] **`/reports` 375px 无横向溢出、表格内部滚动**：控制端浏览器实测（2026-11-01）：七个报表接口
   对 admin/boss/sales1 全部 200；`granularity=month` → 400 `invalid_value`；
   `documentElement.scrollWidth == clientWidth == 375`；竞争对手表格 384px 在 317px 容器内滚动，
   页面无横向溢出。
-- [x] **`/import` 375px 可操作、错误表不撑破页面**：Task 12 运行时（2026-11-01）：模板真下载
+- [x] **`/import` 375px 可操作、错误表不撑破页面**：控制端浏览器实测（2026-11-01）：模板真下载
   6,349 字节；2 行上传同步 `validated` → commit `done` success 2；错误工作簿 → `failed`，
   错误表 317px 落在 317px 容器内，页面无横向溢出；错误 CSV `import-2-errors.csv` 带 BOM
   `EFBBBF` 与引号转义；validated / done / error 三态 `documentElement.scrollWidth == clientWidth == 375`。
-- [x] **「导入」仅 manager/admin 可见**：Task 12 运行时（2026-11-01）：销售直接访问 `/import`
+- [x] **「导入」仅 manager/admin 可见**：控制端浏览器实测（2026-11-01）：销售直接访问 `/import`
   被重定向回 `/`，导航里没有「导入」。
 - [ ] **登录页 / 客户列表 / 机会列表 在 375px 无横向溢出**：未单独覆盖（前端无单测；P6 补）。
   P4 验收只覆盖公海相关页面，P5 运行时只量了 `/reports` 与 `/import`，这三页本次没有重新量测。
@@ -163,7 +164,7 @@ assert [] == ['今天的待办']
 - [ ] **空数据时显示「—」/「暂无数据」，不是 NaN/undefined**：未单独覆盖（前端无单测；P6 补）。
   源码层已确认 `ReportsPage.tsx` 的 `formatRate` / `formatDays` 对 `null` 返回 `—`，表格空数据行
   渲染「暂无数据」；但本次运行时的数据集非空，**没有浏览器实证**，因此不勾选。
-- [ ] **`/import` 无任务时的空态**：未单独覆盖（前端无单测；P6 补）。Task 12 运行时直接上传，
+- [ ] **`/import` 无任务时的空态**：未单独覆盖（前端无单测；P6 补）。控制端浏览器实测直接上传，
   没有停留在「尚无导入任务」的初始态。
 
 ---
@@ -178,11 +179,11 @@ assert [] == ['今天的待办']
 | `GET /reports/activities` | 全公司 | 本部门 | 本人 | `activity_scope_conditions`（按跟进**作者**当前部门，不按客户归属）；`test_activities_scope_by_creator_department` |
 | `GET /reports/competitors` | 全公司 | 本部门 | 本人 | 同 `opportunity_scope_conditions`；`test_competitors_splits_by_dunhao_and_counts_win_rate` |
 | `GET /imports/customers/template` | 200 | 200 | **403** | `ManagerOrAdminUser`；`test_template_endpoint_requires_manager_and_customers_kind` |
-| `POST /imports`（上传） | 200 | 200，但**负责人限本部门** | **403** | `ManagerOrAdminUser` + `validate_customer_rows` 部门判定；`test_upload_rejects_sales_and_unknown_kind`、`test_upload_manager_cannot_use_other_department_owner` |
+| `POST /imports`（上传） | **201** | **201**，但**负责人限本部门** | **403** | `ManagerOrAdminUser` + `validate_customer_rows` 部门判定；`test_upload_rejects_sales_and_unknown_kind`、`test_upload_manager_cannot_use_other_department_owner` |
 | `POST /imports/{id}/commit` | 任意 job | 仅自己创建的 job | **403** | `commit_import_job` → `get_import_job`；非法角色先被 `ManagerOrAdminUser` 挡下 |
 | `GET /imports/{id}` | 任意 | **仅自己创建**（他人 404） | **403** | `get_import_job(actor.role != admin and job.created_by != actor.id → 404)`；`test_job_visibility_is_owner_scoped` |
 | `/reports` 页面 | 可见 | 可见 | 可见（数据自动收窄） | `AppShell.tsx` NAV 无角色限制；前端不做过滤，权限只在后端 |
-| `/import` 页面 | 可见 | 可见 | **重定向 `/`** | `AppShell.tsx` NAV `managerOrAdmin` 隐藏 + `ImportPage.tsx` 页面级闸门（Task 12 运行时实测） |
+| `/import` 页面 | 可见 | 可见 | **重定向 `/`** | `AppShell.tsx` NAV `managerOrAdmin` 隐藏 + `ImportPage.tsx` 页面级闸门（控制端浏览器实测，2026-11-01） |
 
 两条口径要写清，避免 P6 误改：
 
