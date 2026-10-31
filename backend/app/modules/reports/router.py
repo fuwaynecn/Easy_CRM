@@ -13,6 +13,7 @@ from app.modules.reports.schemas import (
     ActivityReport,
     CycleReport,
     FunnelReport,
+    LostReasonReport,
     PerformanceReport,
     WinRateReport,
 )
@@ -20,6 +21,7 @@ from app.modules.reports.service import (
     activities,
     cycle,
     funnel,
+    lost_reasons,
     performance,
     win_rate,
 )
@@ -76,3 +78,13 @@ def get_activities(
     return activities(
         db, user, resolve_period(date_from, date_to), granularity
     )
+
+
+@router.get("/lost-reasons", response_model=LostReasonReport)
+def get_lost_reasons(
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+    date_from: date | None = None,
+    date_to: date | None = None,
+):
+    return lost_reasons(db, user, resolve_period(date_from, date_to))

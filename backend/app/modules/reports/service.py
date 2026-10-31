@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.errors import InvalidValueError
 from app.modules.activities.models import Activity
 from app.modules.departments.models import Department
+from app.modules.lost_reasons.models import LostReason
 from app.modules.opportunities.models import OPPORTUNITY_STAGES, Opportunity
 from app.modules.reports.common import (
     Period,
@@ -34,6 +35,8 @@ from app.modules.reports.schemas import (
     DepartmentRateRead,
     FunnelReport,
     FunnelStageRead,
+    LostReasonRead,
+    LostReasonReport,
     PerformanceMonthRead,
     PerformanceOwnerRead,
     PerformanceReport,
@@ -145,6 +148,54 @@ def win_rate(db: Session, actor: User, period: Period) -> WinRateReport:
         total=total_won + total_lost,
         rate=_rate(total_won, total_lost),
         by_department=by_department,
+    )
+
+
+def lost_reasons(db: Session, actor: User, period: Period) -> LostReasonReport:
+    """输单原因：期间内按原因分组的机会数与金额。
+
+    输单时间没有独立列，取最后一条 `to_stage='lost'` 的 `changed_at`；
+    金额取同一条历史的快照。
+    """
+    lost_hist = latest_stage_subquery(to_stage="lost")
+    amount = func.coalesce(lost_hist.c.amount_snapshot, Opportunity.amount)
+    rows = db.execute(
+        select(
+            LostReason.id,
+            LostReason.name,
+            func.count().label("count"),
+            func.coalesce(func.sum(amount), 0).label("amount"),
+        )
+        .select_from(Opportunity)
+        .join(
+            lost_hist,
+            and_(lost_hist.c.opportunity_id == Opportunity.id, lost_hist.c.rn == 1),
+        )
+        .join(LostReason, LostReason.id == Opportunity.lost_reason_id)
+        .where(
+            *opportunity_scope_conditions(actor),
+            Opportunity.stage == "lost",
+            lost_hist.c.changed_at >= period.start,
+            lost_hist.c.changed_at < period.end,
+        )
+        .group_by(LostReason.id, LostReason.name)
+        .order_by(func.count().desc(), func.sum(amount).desc(), LostReason.id.asc())
+    ).all()
+    items = [
+        LostReasonRead(
+            lost_reason_id=row.id,
+            lost_reason_name=row.name,
+            count=int(row.count),
+            amount=Decimal(row.amount),
+        )
+        for row in rows
+    ]
+    return LostReasonReport(
+        date_from=period.date_from,
+        date_to=period.date_to,
+        total_count=sum(item.count for item in items),
+        total_amount=sum((item.amount for item in items), Decimal(0)),
+        items=items,
     )
 
 

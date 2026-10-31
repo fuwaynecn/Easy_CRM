@@ -33,6 +33,7 @@ from app.modules.opportunities.service import (
 )
 from app.modules.reports.common import resolve_period
 from app.modules.reports.service import activities, funnel
+from app.modules.reports.service import lost_reasons as lost_reason_report
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
 
@@ -432,3 +433,47 @@ def test_activities_by_owner_sorts_by_count(db):
         ("销售B", 2), ("销售A", 1),
     ]
     assert report.total == 3
+
+
+def test_lost_reasons_counts_and_snapshot_amount(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    price = create_lost_reason(db, LostReasonCreate(name="价格高"))
+    budget = create_lost_reason(db, LostReasonCreate(name="预算取消"))
+    a = _opp(db, f["sa"], f["cust_a"], name="A", amount="100.00")
+    b = _opp(db, f["sa"], f["cust_a"], name="B", amount="200.00")
+    c = _opp(db, f["sa"], f["cust_a"], name="C", amount="300.00")
+    _lose(db, f["sa"], a, at=datetime(2026, 10, 10, tzinfo=UTC), reason_id=price.id)
+    _lose(db, f["sa"], b, at=datetime(2026, 10, 11, tzinfo=UTC), reason_id=price.id)
+    _lose(db, f["sa"], c, at=datetime(2026, 10, 12, tzinfo=UTC), reason_id=budget.id)
+    # 输单后改金额：报表仍按输单时点的快照
+    update_opportunity(
+        db, f["sa"], a.id, OpportunityUpdate(amount=Decimal("9999.00"))
+    )
+
+    report = lost_reason_report(db, f["admin"], period)
+
+    assert report.total_count == 3
+    assert report.total_amount == Decimal("600.00")
+    assert [(row.lost_reason_name, row.count, row.amount) for row in report.items] == [
+        ("价格高", 2, Decimal("300.00")),
+        ("预算取消", 1, Decimal("300.00")),
+    ]
+
+
+def test_lost_reasons_period_uses_lost_history_time(db):
+    f = _setup(db)
+    period = resolve_period(
+        datetime(2026, 10, 1).date(), datetime(2026, 10, 31).date(), now=NOW
+    )
+    reason = create_lost_reason(db, LostReasonCreate(name="价格高"))
+    # 创建早于区间、输单在区间内：必须按输单时间计入
+    opp = _opp(db, f["sa"], f["cust_a"], amount="100.00")
+    _set_created_at(db, opp, datetime(2026, 9, 1, tzinfo=UTC))
+    _lose(db, f["sa"], opp, at=datetime(2026, 10, 5, tzinfo=UTC), reason_id=reason.id)
+
+    report = lost_reason_report(db, f["admin"], period)
+
+    assert report.total_count == 1
