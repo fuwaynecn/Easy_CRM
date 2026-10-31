@@ -232,3 +232,39 @@ export interface HomeSummary {
   overdue: FollowUpBlock;
   pool_notice: PoolNoticeBlock;
 }
+
+/** 公海条目：没有 owner_id（无主由字段缺失表达）。 */
+export interface PoolCustomer {
+  id: number;
+  name: string;
+  short_name: string | null;
+  industry: string | null;
+  level: "A" | "B" | "C";
+  region: string | null;
+  status: "active" | "inactive" | "lost";
+  last_activity_at: string | null;
+  /** 后端按上海自然日算好的天数；last_activity_at 为 null 时为 null */
+  days_inactive: number | null;
+  created_at: string;
+}
+
+/** 可分配用户：`owned_count` / `max_owned` 让前端先给出上限提示，后端仍会 409。 */
+export interface AssignableUser {
+  id: number;
+  display_name: string;
+  department_id: number;
+  department_name: string;
+  owned_count: number;
+  max_owned: number;
+  quota_remaining: number;
+}
+
+/** 与后端 `PoolRuleRead` 逐字一致（snake_case，不转 camelCase）。 */
+export interface PoolRules {
+  inactive_days: number;
+  max_owned: number;
+  auto_recycle_enabled: boolean;
+  protect_with_open_deal: boolean;
+  protect_with_pending_followup: boolean;
+  recycle_notice_days: number;
+}

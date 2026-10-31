@@ -12,6 +12,7 @@ import { useAuth } from "../auth/AuthProvider";
 const NAV: { to: string; label: string; end?: boolean }[] = [
   { to: "/", label: "首页", end: true },
   { to: "/customers", label: "客户" },
+  { to: "/pool", label: "公海" },
   { to: "/opportunities", label: "机会", end: true },
   { to: "/opportunities/board", label: "看板" },
 ];

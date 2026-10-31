@@ -12,6 +12,7 @@ import LoginPage from "./pages/LoginPage";
 import OpportunityBoardPage from "./pages/OpportunityBoardPage";
 import OpportunityDetailPage from "./pages/OpportunityDetailPage";
 import OpportunityListPage from "./pages/OpportunityListPage";
+import PoolPage from "./pages/PoolPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -62,6 +63,16 @@ export default function App() {
                 <RequireAuth>
                   <AppShell>
                     <CustomerDetailPage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/pool"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <PoolPage />
                   </AppShell>
                 </RequireAuth>
               }
