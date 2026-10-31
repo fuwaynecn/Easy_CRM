@@ -40,3 +40,12 @@ def today_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
     """「现在」所在的上海时区自然日的 ``[00:00, 次日 00:00)``。"""
     local = (now or datetime.now(UTC)).astimezone(SHANGHAI)
     return day_bounds(local.date())
+
+
+def days_since_local(moment: datetime, now: datetime | None = None) -> int:
+    """按上海自然日算“已经几天没动静”（不看时分）。
+
+    不能 `(now - moment).days`：那是按 24 小时整除，跨日/跨时区会差一天。
+    """
+    current = (now or datetime.now(UTC)).astimezone(SHANGHAI).date()
+    return (current - moment.astimezone(SHANGHAI).date()).days

@@ -17,7 +17,12 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.timeutil import SHANGHAI, today_bounds
+# 明确 re-export：home/router.py 与既有测试仍从 home.service 取 days_since_local，
+# 所以保留模块级导入（真身已移到 app/core/timeutil.py，P4 公海列表也复用它）。
+from app.core.timeutil import (
+    days_since_local,  # noqa: F401
+    today_bounds,
+)
 from app.db.scope import customer_query
 from app.modules.customers.models import Customer
 from app.modules.followups.models import FollowUp
@@ -37,15 +42,6 @@ class HomeSummary:
     overdue_total: int
     pool_notice: list[Customer]
     pool_notice_total: int
-
-
-def days_since_local(moment: datetime, now: datetime | None = None) -> int:
-    """按上海自然日算"已经几天没动静"（不看时分）。
-
-    不能用 `(now - moment).days`：那是按 24 小时整除，跨时区/跨日会差一天。
-    """
-    current = (now or datetime.now(UTC)).astimezone(SHANGHAI).date()
-    return (current - moment.astimezone(SHANGHAI).date()).days
 
 
 def _my_customers(actor: User):

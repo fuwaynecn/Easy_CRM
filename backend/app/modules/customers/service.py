@@ -270,6 +270,7 @@ def list_customers(
     procurement_type: str | None = None,
     budget_status: str | None = None,
     owner_id: int | None = None,
+    pool_only: bool = False,
     date_from: date | None = None,
     date_to: date | None = None,
     page: int = 1,
@@ -286,6 +287,8 @@ def list_customers(
     会漏掉 ``date_to`` 当天下午的记录。``last_activity_at`` 为 NULL（从未跟进）的
     客户在用了任一端日期筛选时都不会出现在结果里——SQL 比较对 NULL 结果为未知，
     这是刻意的：从未跟进的客户不属于任何"最后跟进时间区间"。
+
+    ``pool_only=True`` 是公海列表专用：与 ``owner_id`` 互斥，调用方只传 pool_only。
     """
     _validate_filter_enums(
         level=level,
@@ -329,6 +332,8 @@ def list_customers(
         stmt = stmt.where(Customer.budget_status == budget_status)
     if owner_id is not None:
         stmt = stmt.where(Customer.owner_id == owner_id)
+    if pool_only:
+        stmt = stmt.where(Customer.owner_id.is_(None))
     if date_from is not None:
         stmt = stmt.where(Customer.last_activity_at >= day_start(date_from))
     if date_to is not None:
@@ -349,7 +354,11 @@ def list_customers(
     if column is None:
         raise InvalidValueError(f"不支持的排序字段：{field}")
     # 第二排序键 id 保证翻页稳定：created_at 相同（批量导入）时不会漏页/重页
-    stmt = stmt.order_by(column.desc() if descending else column.asc(), Customer.id)
+    if field == "last_activity_at" and not descending:
+        order = column.asc().nulls_first()
+    else:
+        order = column.desc() if descending else column.asc()
+    stmt = stmt.order_by(order, Customer.id)
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
     return list(db.execute(stmt).scalars().all()), int(total)
 

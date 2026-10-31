@@ -5,6 +5,8 @@
 `rules.update_pool_rules`，不放在 Pydantic 的 model_validator 里。
 """
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -26,3 +28,17 @@ class PoolRulesUpdate(BaseModel):
     protect_with_open_deal: bool | None = None
     protect_with_pending_followup: bool | None = None
     recycle_notice_days: int | None = Field(default=None, ge=0, le=3650)
+
+
+class PoolCustomerRead(BaseModel):
+    id: int
+    name: str
+    short_name: str | None
+    industry: str | None
+    level: str
+    region: str | None
+    status: str
+    last_activity_at: datetime | None
+    # 从未跟进是 None，不是 0：0 会被前端显示成“今天刚跟过”
+    days_inactive: int | None
+    created_at: datetime
