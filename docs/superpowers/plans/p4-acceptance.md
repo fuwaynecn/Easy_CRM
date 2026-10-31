@@ -25,12 +25,12 @@
 
 | 项 | 命令（工作目录） | 实测结果 |
 |---|---|---|
-| 全量后端测试 | `cd backend && .venv\Scripts\python.exe -m pytest tests -q` | `652 passed, 1 warning in 280.30s (0:04:40)` |
-| E2E 单文件 | `cd backend && .venv\Scripts\python.exe -m pytest tests/test_e2e.py -q` | `14 passed, 1 warning in 9.78s` |
+| 全量后端测试 | `cd backend && .venv\Scripts\python.exe -m pytest tests -q` | `652 passed, 1 warning in 293.23s (0:04:53)` |
+| E2E 单文件 | `cd backend && .venv\Scripts\python.exe -m pytest tests/test_e2e.py -q` | `14 passed, 1 warning in 10.05s` |
 | 迁移 | `cd backend && .venv\Scripts\python.exe -m alembic upgrade head` | `aca0bc139888 -> b7f3c1a2d4e5, create pool_rules` → `b7f3c1a2d4e5 -> c8e4d2b3f5a6, create owner_change_logs and audit_logs`；`alembic current` = `c8e4d2b3f5a6 (head)` |
 | 种子幂等 | `cd backend && .venv\Scripts\python.exe -m scripts.seed`（连跑 3 次） | 每次均为 `本次新建 0 条记录：`、`部门：跳过 2 条`、`用户：跳过 5 条` |
 | 静态检查 | `.\backend\.venv\Scripts\python -m ruff check backend`（仓库根） | `All checks passed!` |
-| 前端构建 | `cd frontend && npm.cmd run build` | `tsc --noEmit && vite build` 通过：`115 modules transformed`、`dist/assets/index-Bnt4RtGg.js 297.87 kB │ gzip: 87.65 kB`、`built in 1.79s` |
+| 前端构建 | `cd frontend && npm.cmd run build` | `tsc --noEmit && vite build` 通过：`115 modules transformed`、`dist/assets/index-CZmEIkwS.js 297.87 kB │ gzip: 87.65 kB`、`built in 1.94s` |
 
 唯一的 warning 是既有的 `StarletteDeprecationWarning: Using httpx with
 starlette.testclient is deprecated`，P1 起就在，不是 P4 引入。

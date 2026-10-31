@@ -242,7 +242,8 @@ function summarize(item: TimelineItem): string {
     const action = item.owner_change_action;
     if (action === "claim") return `${item.operator_name} 领取了客户`;
     if (action === "recycle") {
-      return `系统自动回收：${item.content ?? "长期无跟进"}`;
+      // reason 已是完整句子（「连续 N 天无跟进，系统自动回收」），再前缀会出现重复。
+      return item.content ?? "系统自动回收（长期无跟进）";
     }
     if (action === "assign") {
       return `${item.operator_name} 分配给 ${item.to_owner_name ?? "—"}`;
