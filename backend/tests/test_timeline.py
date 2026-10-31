@@ -5,6 +5,7 @@
 而是把它们钉成契约——否则某次顺手加的 `deleted_at IS NULL` 会让历史凭空消失。
 """
 
+from base64 import urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -202,6 +203,17 @@ def test_timeline_cursor_roundtrip_and_invalid_cursor(db):
         decode_cursor("not-a-cursor")
 
 
+def test_timeline_cursor_rejects_unknown_type():
+    """成员守卫仍承重：P3 拒绝 owner_change 的用例已反转，但未知 type 仍必须 400。
+
+    `decode_cursor("not-a-cursor")` 在 base64 就抛了，走不到 `CURSOR_TYPES` 检查；
+    这里用合法 base64 把 type 喂进去，单独钉住那道 ``type_raw not in CURSOR_TYPES``。
+    """
+    raw = urlsafe_b64encode(f"{NOW.isoformat()}|bogus|1".encode()).decode()
+    with pytest.raises(InvalidValueError):
+        decode_cursor(raw)
+
+
 def test_timeline_hides_soft_deleted_activity(db):
     """裁定 1 的两面：已删**活动**不再出现，已删**机会**的阶段历史仍然出现。
 
@@ -249,18 +261,28 @@ def test_timeline_rejects_non_positive_limit(db):
             get_timeline(db, f["sa"], f["cust_a"].id, limit=bad_limit)
 
 
-def test_timeline_cursor_rejects_unimplemented_owner_change_type(db):
-    """`owner_change` 只在枚举里占位（P4 才接入），伪造这种游标必须 400。
+def test_timeline_cursor_accepts_owner_change_type(db):
+    """P4 接上第三路后，owner_change 游标是合法的（与 P3 的占位测试相反）。"""
+    from app.modules.pools.service import record_owner_change
 
-    放它过去会让游标条件永远匹配不到，安静地返回空页——比 400 难查得多。
-    """
-    from base64 import urlsafe_b64encode
+    f = _setup(db)
+    record_owner_change(
+        db,
+        customer_id=f["cust_a"].id,
+        action="claim",
+        from_owner_id=None,
+        to_owner_id=f["sa"].id,
+        operator_id=f["sa"].id,
+    )
+    db.commit()
 
-    raw = f"{NOW.isoformat()}|owner_change|1"
-    forged = urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    entries, _ = get_timeline(db, f["sa"], f["cust_a"].id)
+    cursor = encode_cursor(entries[0])
+    parsed = decode_cursor(cursor)
 
-    with pytest.raises(InvalidValueError):
-        decode_cursor(forged)
+    assert parsed.type == "owner_change"
+    assert parsed.id == entries[0].id
+    assert parsed.occurred_at == entries[0].occurred_at
 
 
 def test_timeline_of_invisible_customer_is_403_and_missing_is_404(db):
@@ -304,3 +326,142 @@ def test_timeline_api_shape(client, db):
     )
     assert forbidden.status_code == 403
     assert forbidden.json()["code"] == "forbidden"
+
+
+def test_timeline_includes_owner_change_with_names_and_system_operator(db):
+    from app.modules.pools.service import record_owner_change
+
+    f = _setup(db)
+    record_owner_change(
+        db,
+        customer_id=f["cust_a"].id,
+        action="claim",
+        from_owner_id=None,
+        to_owner_id=f["sa"].id,
+        operator_id=f["sa"].id,
+    )
+    db.commit()
+    record_owner_change(
+        db,
+        customer_id=f["cust_a"].id,
+        action="transfer",
+        from_owner_id=f["sa"].id,
+        to_owner_id=f["boss"].id,
+        operator_id=f["boss"].id,
+        reason="区域调整",
+    )
+    db.commit()
+    record_owner_change(
+        db,
+        customer_id=f["cust_a"].id,
+        action="recycle",
+        from_owner_id=f["boss"].id,
+        to_owner_id=None,
+        operator_id=None,
+        reason="连续 30 天无跟进，系统自动回收",
+    )
+    db.commit()
+
+    entries, _ = get_timeline(db, f["admin"], f["cust_a"].id)
+    owner_entries = [entry for entry in entries if entry.type == "owner_change"]
+
+    # 三个独立事务：created_at 递增，倒序为 recycle -> transfer -> claim
+    assert [entry.owner_change_action for entry in owner_entries] == [
+        "recycle",
+        "transfer",
+        "claim",
+    ]
+    recycle = owner_entries[0]
+    assert recycle.operator_id is None
+    assert recycle.operator_name == "系统"
+    assert recycle.operator_disabled is False
+    assert recycle.from_owner_name == "东区主管"
+    assert recycle.to_owner_name is None
+    assert recycle.content == "连续 30 天无跟进，系统自动回收"
+
+    transfer = owner_entries[1]
+    assert transfer.operator_name == "东区主管"
+    assert transfer.from_owner_name == "销售A"
+    assert transfer.to_owner_name == "东区主管"
+    assert transfer.content == "区域调整"
+
+    claim = owner_entries[2]
+    assert claim.operator_name == "销售A"
+    assert claim.from_owner_name is None
+    assert claim.to_owner_name == "销售A"
+    assert claim.content is None
+
+
+def test_timeline_pages_across_owner_change_and_activity(db):
+    from app.modules.pools.service import record_owner_change
+
+    f = _setup(db)
+    create_activity(
+        db,
+        f["sa"],
+        ActivityCreate(
+            customer_id=f["cust_a"].id,
+            content="电话",
+            # 固定成一年前：owner_change 的 created_at 由数据库 now() 生成，
+            # 不依赖测试运行时刻也能保证 owner_change 排在活动之后。
+            activity_at=NOW - timedelta(days=365),
+        ),
+    )
+    record_owner_change(
+        db,
+        customer_id=f["cust_a"].id,
+        action="claim",
+        from_owner_id=None,
+        to_owner_id=f["sa"].id,
+        operator_id=f["sa"].id,
+    )
+    db.commit()
+
+    page1, cursor1 = get_timeline(db, f["sa"], f["cust_a"].id, limit=1)
+    page2, cursor2 = get_timeline(
+        db, f["sa"], f["cust_a"].id, limit=1, cursor=cursor1
+    )
+
+    assert [entry.type for entry in page1] == ["owner_change"]
+    assert [entry.type for entry in page2] == ["activity"]
+    assert cursor2 is None
+    # 上面两行只保证「两页类型不同」——类型不同时旧的三元组不等式恒为真，断不出
+    # 「第二页真的更旧」。这里钉住排序键严格后退（活动比 owner_change 早整一年）。
+    assert (page2[0].occurred_at, page2[0].type, page2[0].id) < (
+        page1[0].occurred_at,
+        page1[0].type,
+        page1[0].id,
+    )
+
+
+def test_timeline_api_exposes_owner_change_fields(client, db):
+    from app.modules.pools.service import record_owner_change
+
+    f = _setup(db)
+    record_owner_change(
+        db,
+        customer_id=f["cust_a"].id,
+        action="release",
+        from_owner_id=f["sa"].id,
+        to_owner_id=None,
+        operator_id=f["boss"].id,
+        reason="客户长期不回复",
+    )
+    db.commit()
+    login = client.post(
+        "/api/v1/auth/login", json={"username": "sales_a", "password": PASSWORD}
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    response = client.get(
+        f"/api/v1/customers/{f['cust_a'].id}/timeline", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    item = response.json()["items"][0]
+    assert item["type"] == "owner_change"
+    assert item["owner_change_action"] == "release"
+    assert item["from_owner_name"] == "销售A"
+    assert item["to_owner_name"] is None
+    assert item["content"] == "客户长期不回复"
+    assert item["operator_name"] == "东区主管"

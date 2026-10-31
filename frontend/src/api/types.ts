@@ -187,6 +187,10 @@ export interface TimelineItem {
   to_stage: string | null;
   /** 阶段变更**当刻**的金额（定点字符串），不是机会现值 */
   amount_snapshot: string | null;
+  /** owner_change 的动作：claim / recycle / assign / transfer / release */
+  owner_change_action: string | null;
+  from_owner_name: string | null;
+  to_owner_name: string | null;
 }
 
 export interface TimelinePage {

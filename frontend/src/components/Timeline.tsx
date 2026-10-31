@@ -1,6 +1,7 @@
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
 
 import { deleteActivity } from "../api/activities";
 import { errorMessage } from "../api/client";
@@ -118,7 +119,19 @@ export function Timeline({ customerId, writable, onEdit }: Props) {
                   {/* 联系人没有单条页、已删的更不能点：一律纯文本 + 灰色标签 */}
                   {item.contact_deleted ? <MutedTag>联系人已删除</MutedTag> : null}
                   {item.opportunity_name ? (
-                    <span className="break-words">· {item.opportunity_name}</span>
+                    <span className="break-words">
+                      ·{" "}
+                      {item.opportunity_id !== null && !item.opportunity_deleted ? (
+                        <Link
+                          to={`/opportunities/${item.opportunity_id}`}
+                          className="text-brand-600 hover:underline"
+                        >
+                          {item.opportunity_name}
+                        </Link>
+                      ) : (
+                        item.opportunity_name
+                      )}
+                    </span>
                   ) : null}
                   {item.opportunity_deleted ? <MutedTag>机会已删除</MutedTag> : null}
                   {item.type === "stage_change" && item.amount_snapshot ? (
@@ -226,6 +239,21 @@ function labelOfType(item: TimelineItem): string {
 function summarize(item: TimelineItem): string {
   if (item.type === "activity") return item.content ?? "";
   if (item.type === "owner_change") {
+    const action = item.owner_change_action;
+    if (action === "claim") return `${item.operator_name} 领取了客户`;
+    if (action === "recycle") {
+      return `系统自动回收：${item.content ?? "长期无跟进"}`;
+    }
+    if (action === "assign") {
+      return `${item.operator_name} 分配给 ${item.to_owner_name ?? "—"}`;
+    }
+    if (action === "transfer") {
+      return `${item.operator_name} 将负责人从 ${item.from_owner_name ?? "—"} 转给 ${item.to_owner_name ?? "—"}`;
+    }
+    if (action === "release") {
+      const reason = item.content ? `：${item.content}` : "";
+      return `${item.operator_name} 释放回公海${reason}`;
+    }
     return `${item.operator_name} 变更了负责人`;
   }
   const from = item.from_stage ? (STAGE_LABELS[item.from_stage] ?? item.from_stage) : "创建";

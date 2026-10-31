@@ -26,16 +26,19 @@ from app.modules.activities.models import Activity
 from app.modules.contacts.models import Contact
 from app.modules.customers.service import get_customer
 from app.modules.opportunities.models import Opportunity, StageHistory
+from app.modules.pools.models import OwnerChangeLog
 from app.modules.users.models import STATUS_ACTIVE, User
 
-# owner_change 预留给 P4（裁定 6）：枚举先占位，P4 只加一路 UNION，不改前端契约
-TIMELINE_TYPES = ("activity", "stage_change", "owner_change")
 ACTIVITY_TIMELINE_TYPE = "activity"
 STAGE_CHANGE_TIMELINE_TYPE = "stage_change"
-
-# 游标只认已实现的两类：伪造一个 owner_change 游标会让分页条件永远匹配不到，
-# 静默返回空页比 400 更难查。P4 接上 owner_change_logs 后再把常量改成 TIMELINE_TYPES。
-CURSOR_TYPES = (ACTIVITY_TIMELINE_TYPE, STAGE_CHANGE_TIMELINE_TYPE)
+OWNER_CHANGE_TIMELINE_TYPE = "owner_change"
+TIMELINE_TYPES = (
+    ACTIVITY_TIMELINE_TYPE,
+    STAGE_CHANGE_TIMELINE_TYPE,
+    OWNER_CHANGE_TIMELINE_TYPE,
+)
+# P4：三路都已实现，游标接受全部类型
+CURSOR_TYPES = TIMELINE_TYPES
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,9 @@ class TimelineEntry:
     from_stage: str | None
     to_stage: str | None
     amount_snapshot: Decimal | None
+    owner_change_action: str | None = None
+    from_owner_name: str | None = None
+    to_owner_name: str | None = None
 
 
 def encode_cursor(entry: TimelineEntry) -> str:
@@ -117,7 +123,15 @@ def _page_rows(
         .where(Opportunity.customer_id == customer_id)
     )
 
-    merged = activities.union_all(histories).subquery()
+    owner_changes = select(
+        literal(OWNER_CHANGE_TIMELINE_TYPE, type_=String).label("type"),
+        OwnerChangeLog.id.label("id"),
+        OwnerChangeLog.created_at.label("occurred_at"),
+    ).where(OwnerChangeLog.customer_id == customer_id)
+
+    # SQLAlchemy 2.1 的 CompoundSelect 不再暴露链式 union_all（只有私有构造器），
+    # 改成一次传入全部三路：等价于 a UNION ALL b UNION ALL c。
+    merged = activities.union_all(histories, owner_changes).subquery()
     stmt = select(merged.c.type, merged.c.id, merged.c.occurred_at)
     if cursor is not None:
         # 字典序倒序：a < x 或 (a == x 且 b < y) 或 (a == x 且 b == y 且 c < z)
@@ -170,6 +184,22 @@ def _assemble(db: Session, rows: list) -> list[TimelineEntry]:
         ).scalars():
             histories[history.id] = history
 
+    owner_change_ids = [
+        row.id for row in rows if row.type == OWNER_CHANGE_TIMELINE_TYPE
+    ]
+    owner_changes: dict[int, OwnerChangeLog] = {}
+    if owner_change_ids:
+        for change in db.execute(
+            select(OwnerChangeLog)
+            .options(
+                joinedload(OwnerChangeLog.operator),
+                joinedload(OwnerChangeLog.from_owner),
+                joinedload(OwnerChangeLog.to_owner),
+            )
+            .where(OwnerChangeLog.id.in_(owner_change_ids))
+        ).scalars():
+            owner_changes[change.id] = change
+
     # 联系人单独按 id 取，**故意不带 deleted_at 过滤**（裁定 1）：已删联系人的姓名
     # 仍要显示在历史行上。这里不复用任何带软删过滤的读函数，避免哪天过滤被"统一"进来。
     contact_ids = {
@@ -218,7 +248,7 @@ def _assemble(db: Session, rows: list) -> list[TimelineEntry]:
                     amount_snapshot=None,
                 )
             )
-        else:
+        elif row.type == STAGE_CHANGE_TIMELINE_TYPE:
             history = histories[row.id]
             operator = history.operator
             opportunity = history.opportunity
@@ -245,6 +275,39 @@ def _assemble(db: Session, rows: list) -> list[TimelineEntry]:
                     from_stage=history.from_stage,
                     to_stage=history.to_stage,
                     amount_snapshot=history.amount_snapshot,
+                )
+            )
+        elif row.type == OWNER_CHANGE_TIMELINE_TYPE:
+            change = owner_changes[row.id]
+            operator = change.operator
+            entries.append(
+                TimelineEntry(
+                    type=OWNER_CHANGE_TIMELINE_TYPE,
+                    id=change.id,
+                    occurred_at=change.created_at,
+                    operator_id=change.operator_id,
+                    operator_name=operator.display_name if operator else "系统",
+                    operator_disabled=bool(
+                        operator is not None and operator.status != STATUS_ACTIVE
+                    ),
+                    activity_type=None,
+                    content=change.reason,
+                    contact_id=None,
+                    contact_name=None,
+                    contact_deleted=False,
+                    opportunity_id=None,
+                    opportunity_name=None,
+                    opportunity_deleted=False,
+                    from_stage=None,
+                    to_stage=None,
+                    amount_snapshot=None,
+                    owner_change_action=change.action,
+                    from_owner_name=(
+                        change.from_owner.display_name if change.from_owner else None
+                    ),
+                    to_owner_name=(
+                        change.to_owner.display_name if change.to_owner else None
+                    ),
                 )
             )
     return entries

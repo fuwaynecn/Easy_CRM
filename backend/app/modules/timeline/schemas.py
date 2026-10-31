@@ -1,7 +1,7 @@
 """时间线的线上契约。
 
-`type` 现在只会是 `activity` / `stage_change`，但 `owner_change` **预留**在枚举里
-（裁定 6）：P4 建 `owner_change_logs` 后接入这一路，前端契约不变、不需要再改类型。
+`type` 会是 `activity` / `stage_change` / `owner_change`（P4 接入 `owner_change_logs`，
+裁定 6）。
 """
 
 from datetime import datetime
@@ -39,6 +39,11 @@ class TimelineItemRead(BaseModel):
     # 时点金额（裁定 4）：numeric(14,2) 在线上仍是定点字符串（pydantic 把 Decimal
     # 序列化成字符串，与金额列同一惯例，前端 formatAmount 直接可用）
     amount_snapshot: Decimal | None
+
+    # P4：owner_change 条目的动作与前后负责人姓名（其它类型为 None）
+    owner_change_action: str | None = None
+    from_owner_name: str | None = None
+    to_owner_name: str | None = None
 
 
 class TimelinePageRead(BaseModel):
