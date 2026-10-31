@@ -1,0 +1,28 @@
+"""公海池的 HTTP 契约。
+
+规则更新全部可选：PATCH 的语义是“只改给的字段”，其余保持当前值。跨字段约束
+（`recycle_notice_days < inactive_days`）必须拿当前值合并后再判，所以放在
+`rules.update_pool_rules`，不放在 Pydantic 的 model_validator 里。
+"""
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class PoolRuleRead(BaseModel):
+    inactive_days: int
+    max_owned: int
+    auto_recycle_enabled: bool
+    protect_with_open_deal: bool
+    protect_with_pending_followup: bool
+    recycle_notice_days: int
+
+
+class PoolRulesUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inactive_days: int | None = Field(default=None, ge=1, le=3650)
+    max_owned: int | None = Field(default=None, ge=1, le=10000)
+    auto_recycle_enabled: bool | None = None
+    protect_with_open_deal: bool | None = None
+    protect_with_pending_followup: bool | None = None
+    recycle_notice_days: int | None = Field(default=None, ge=0, le=3650)

@@ -48,6 +48,9 @@ CHECK_CONSTRAINT_NAMES = {
         "ck_stage_histories_from_stage",
         "ck_stage_histories_to_stage",
     },
+    "pool_rules": {
+        "ck_pool_rules_single_row",
+    },
 }
 
 # CHECK 的**表达式**：``compare_metadata`` 不比 CHECK，名字断言只挡"被删/改名"。
@@ -210,3 +213,15 @@ def test_migrated_schema_keeps_named_checks_and_column_defaults(engine: Engine) 
                 ),
                 {"customer_id": customer_id, "owner_id": owner_id},
             )
+
+        # 公海规则：迁移必须插入 id=1 的默认行，且 id=1 单行约束在库上生效
+        pool_row = connection.execute(
+            text(
+                "SELECT id, inactive_days, max_owned, auto_recycle_enabled, "
+                "protect_with_open_deal, protect_with_pending_followup, recycle_notice_days "
+                "FROM pool_rules"
+            )
+        ).one()
+        assert tuple(pool_row) == (1, 30, 50, True, True, True, 3)
+        with pytest.raises(IntegrityError), connection.begin_nested():
+            connection.execute(text("INSERT INTO pool_rules (id) VALUES (2)"))

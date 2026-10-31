@@ -10,4 +10,5 @@ from app.modules.departments.models import Department  # noqa: F401
 from app.modules.followups.models import FollowUp  # noqa: F401
 from app.modules.lost_reasons.models import LostReason  # noqa: F401
 from app.modules.opportunities.models import Opportunity, StageHistory  # noqa: F401
+from app.modules.pools.models import PoolRule  # noqa: F401
 from app.modules.users.models import User  # noqa: F401
