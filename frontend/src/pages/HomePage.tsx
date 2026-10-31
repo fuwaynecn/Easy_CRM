@@ -7,6 +7,7 @@ import { errorMessage } from "../api/client";
 import { completeFollowUp } from "../api/followUps";
 import { getHome } from "../api/home";
 import type { FollowUp, HomeSummary, PoolNoticeItem } from "../api/types";
+import { useAuth } from "../auth/AuthProvider";
 import { FollowUpDoneModal } from "../components/FollowUpDoneModal";
 import { QueryError } from "../components/QueryError";
 import { formatClock } from "../constants/datetime";
@@ -19,6 +20,7 @@ import { formatClock } from "../constants/datetime";
  * 后续的回收任务各算一套。
  */
 export default function HomePage() {
+  const { user } = useAuth();
   const queryClient = useQueryClient();
   const home = useQuery({ queryKey: ["home"], queryFn: getHome });
   const [doneTarget, setDoneTarget] = useState<FollowUp | null>(null);
@@ -99,7 +101,10 @@ export default function HomePage() {
           <p className="text-xs text-slate-400">
             {data.pool_notice.rule.inactive_days} 天无跟进进入回收区间，提前{" "}
             {data.pool_notice.rule.recycle_notice_days} 天预警；有在谈机会或未完成待办的客户不预警。
-            规则将于 P4 可配置。
+            规则可在「公海规则」中配置。
+            {user?.role === "admin"
+              ? " 管理员首页的今日/逾期包含全公司客户。"
+              : ""}
           </p>
         }
       >

@@ -22,11 +22,7 @@ from app.modules.home.schemas import (
     PoolNoticeRule,
 )
 from app.modules.home.service import days_since_local, summary
-from app.modules.pools.rules import (
-    INACTIVE_DAYS,
-    NOTICE_THRESHOLD_DAYS,
-    RECYCLE_NOTICE_DAYS,
-)
+from app.modules.pools.rules import load_pool_rules
 
 router = APIRouter(tags=["home"])
 
@@ -37,7 +33,8 @@ def get_home(
     user: CurrentUser,
 ):
     now = datetime.now(UTC)
-    result = summary(db, user, now=now)
+    rules = load_pool_rules(db)
+    result = summary(db, user, now=now, rules=rules)
     return HomeRead(
         today=FollowUpBlock(
             total=result.today_total,
@@ -65,9 +62,9 @@ def get_home(
                 for customer in result.pool_notice
             ],
             rule=PoolNoticeRule(
-                inactive_days=INACTIVE_DAYS,
-                recycle_notice_days=RECYCLE_NOTICE_DAYS,
-                threshold_days=NOTICE_THRESHOLD_DAYS,
+                inactive_days=rules.inactive_days,
+                recycle_notice_days=rules.recycle_notice_days,
+                threshold_days=rules.notice_threshold_days,
             ),
         ),
     )

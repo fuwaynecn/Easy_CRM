@@ -23,7 +23,9 @@ from app.modules.pools.rules import (
     INACTIVE_DAYS,
     NOTICE_THRESHOLD_DAYS,
     RECYCLE_NOTICE_DAYS,
+    update_pool_rules,
 )
+from app.modules.pools.schemas import PoolRulesUpdate
 from app.modules.users.models import ROLE_ADMIN, ROLE_MANAGER, ROLE_SALES
 from app.modules.users.service import create_user
 
@@ -277,3 +279,93 @@ def test_home_api_shape(client, db):
     anonymous = client.get("/api/v1/home")
     assert anonymous.status_code == 401
     assert anonymous.json()["code"] == "unauthorized"
+
+
+def test_admin_home_today_and_overdue_include_all_owners(db):
+    f = _setup(db)
+    todo = _todo(db, f["sa"], f["cust_a"], due_at=NOW)
+
+    admin_result = summary(db, f["admin"], now=NOW)
+
+    assert [item.id for item in admin_result.today] == [todo.id]
+    assert admin_result.today_total == 1
+    # 主管仍只看自己名下：cust_a 的负责人是销售 A，不是主管
+    assert summary(db, f["boss"], now=NOW).today_total == 0
+
+
+def test_home_pool_notice_uses_configured_rules(db):
+    f = _setup(db)
+    aged = create_customer(db, f["sa"], CustomerCreate(name="9 天没跟进"))
+    _age_customer(db, aged, days=9)
+    update_pool_rules(
+        db, PoolRulesUpdate(inactive_days=10, recycle_notice_days=2)
+    )
+
+    result = summary(db, f["sa"], now=NOW)
+
+    assert aged.id in [customer.id for customer in result.pool_notice]
+
+
+def test_home_pool_notice_respects_protect_flags(db):
+    f = _setup(db)
+    with_deal = create_customer(db, f["sa"], CustomerCreate(name="有在谈机会"))
+    _age_customer(db, with_deal, days=28)
+    create_opportunity(
+        db,
+        f["sa"],
+        OpportunityCreate(customer_id=with_deal.id, name="在谈机会"),
+    )
+
+    # 默认保护：不预警
+    assert with_deal.id not in [
+        customer.id for customer in summary(db, f["sa"], now=NOW).pool_notice
+    ]
+
+    update_pool_rules(db, PoolRulesUpdate(protect_with_open_deal=False))
+    assert with_deal.id in [
+        customer.id for customer in summary(db, f["sa"], now=NOW).pool_notice
+    ]
+
+
+def test_home_pool_notice_respects_pending_followup_flag(db):
+    """未完成待办的保护也必须是开关，不能写死。
+
+    镜像 `test_home_pool_notice_respects_protect_flags`：把待办那条保护关掉后，
+    同一个客户必须立刻进预警。若哪天有人把 `if rules.protect_with_pending_followup:`
+    改成常量真值或整段删掉，这条会红。
+    """
+    f = _setup(db)
+    planned = create_customer(db, f["sa"], CustomerCreate(name="有待办但保护可关"))
+    _age_customer(db, planned, days=28)
+    _todo(db, f["sa"], planned, due_at=NOW + timedelta(days=3))
+
+    # 默认保护：不预警
+    assert planned.id not in [
+        customer.id for customer in summary(db, f["sa"], now=NOW).pool_notice
+    ]
+
+    update_pool_rules(db, PoolRulesUpdate(protect_with_pending_followup=False))
+    assert planned.id in [
+        customer.id for customer in summary(db, f["sa"], now=NOW).pool_notice
+    ]
+
+
+def test_home_api_returns_rule_from_database(client, db):
+    # 只需要客户/用户基线；接口用 sales_a 登录，这里不直接用返回的夹具。
+    _setup(db)
+    update_pool_rules(
+        db, PoolRulesUpdate(inactive_days=12, recycle_notice_days=2)
+    )
+    login = client.post(
+        "/api/v1/auth/login", json={"username": "sales_a", "password": PASSWORD}
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    response = client.get("/api/v1/home", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["pool_notice"]["rule"] == {
+        "inactive_days": 12,
+        "recycle_notice_days": 2,
+        "threshold_days": 10,
+    }
