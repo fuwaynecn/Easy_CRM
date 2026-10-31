@@ -9,12 +9,13 @@ import { useAuth } from "../auth/AuthProvider";
  * - `/` 是所有路径的前缀，不加 `end` 会让"首页"在每个页面都高亮；
  * - `/opportunities` 是 `/opportunities/board` 的前缀，不加会让看板页两个导航项同亮。
  */
-const NAV: { to: string; label: string; end?: boolean }[] = [
+const NAV: { to: string; label: string; end?: boolean; adminOnly?: boolean }[] = [
   { to: "/", label: "首页", end: true },
   { to: "/customers", label: "客户" },
   { to: "/pool", label: "公海" },
   { to: "/opportunities", label: "机会", end: true },
   { to: "/opportunities/board", label: "看板" },
+  { to: "/admin/pool-rules", label: "公海规则", adminOnly: true },
 ];
 
 export function AppShell({ children }: { children: ReactNode }) {
@@ -57,7 +58,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <nav
           className={`${open ? "block" : "hidden"} w-full border-b border-slate-200 bg-white p-2 md:block md:w-48 md:border-b-0 md:border-r`}
         >
-          {NAV.map((item) => (
+          {NAV.filter((item) => !item.adminOnly || user?.role === "admin").map((item) => (
             <NavLink
               key={item.to}
               to={item.to}

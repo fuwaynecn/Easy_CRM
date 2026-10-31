@@ -5,6 +5,7 @@ import { ApiError } from "./api/client";
 import { AuthProvider } from "./auth/AuthProvider";
 import { RequireAuth } from "./auth/RequireAuth";
 import { AppShell } from "./components/AppShell";
+import AdminPoolRulesPage from "./pages/AdminPoolRulesPage";
 import CustomerDetailPage from "./pages/CustomerDetailPage";
 import CustomerListPage from "./pages/CustomerListPage";
 import HomePage from "./pages/HomePage";
@@ -73,6 +74,16 @@ export default function App() {
                 <RequireAuth>
                   <AppShell>
                     <PoolPage />
+                  </AppShell>
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/admin/pool-rules"
+              element={
+                <RequireAuth>
+                  <AppShell>
+                    <AdminPoolRulesPage />
                   </AppShell>
                 </RequireAuth>
               }
