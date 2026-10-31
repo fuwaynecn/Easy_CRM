@@ -10,6 +10,9 @@ from sqlalchemy.orm import Session
 from app.core.errors import AppError
 from app.db.session import get_db
 from app.main import create_app
+from app.modules.departments.service import create_department
+from app.modules.users.models import ROLE_ADMIN
+from app.modules.users.service import create_user
 
 
 def _app_with_db(db):
@@ -106,3 +109,58 @@ def test_app_error_detail_with_datetime_and_exception_is_serializable(db):
     assert body["message"] == "内部错误"
     assert isinstance(body["detail"]["at"], str)
     assert isinstance(body["detail"]["err"], dict)
+
+
+# 未处理异常的线上契约。
+#
+# P3 已知限制 #7：未处理异常走 Starlette 默认 500，响应是纯文本 "Internal Server Error"，
+# 前端 errorMessage 拿不到 {code,message,detail}。P4 统一成 JSON，且不把异常文本回显给
+# 客户端（可能含 SQL、路径、密钥片段）。与上面 404/405/422/AppError 属同一错误体契约，
+# 故并入本文件。
+
+PASSWORD = "Passw0rd!"
+
+
+def _setup(db):
+    east = create_department(db, "华东销售部")
+    create_user(
+        db,
+        username="admin",
+        password=PASSWORD,
+        display_name="管理员",
+        role=ROLE_ADMIN,
+        department_id=None,
+    )
+    return {"east": east}
+
+
+def _auth(client) -> dict[str, str]:
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"username": "admin", "password": PASSWORD},
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def test_unhandled_exception_returns_json_500(client, db, monkeypatch, caplog):
+    _setup(db)
+    headers = _auth(client)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("数据库口令不能出现在响应里")
+
+    monkeypatch.setattr("app.modules.home.router.summary", boom)
+
+    with TestClient(client.app, raise_server_exceptions=False) as raw:
+        response = raw.get("/api/v1/home", headers=headers)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {
+        "code": "internal_error",
+        "message": "服务器内部错误",
+        "detail": None,
+    }
+    assert "数据库口令" not in response.text
+    assert any("数据库口令" in record.getMessage() or record.exc_info for record in caplog.records)

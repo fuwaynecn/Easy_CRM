@@ -82,6 +82,26 @@ def create_app() -> FastAPI:
     async def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
         return error_response(exc)
 
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        # 不回显 str(exc)：SQL、文件路径、配置片段都可能藏在异常文本里。
+        logger.error(
+            "未处理异常：%s %s",
+            request.method,
+            request.url.path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": "internal_error",
+                "message": "服务器内部错误",
+                "detail": None,
+            },
+        )
+
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(
         request: Request, exc: StarletteHTTPException
