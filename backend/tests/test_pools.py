@@ -15,9 +15,10 @@ from app.core.errors import (
     InvalidValueError,
     NotFoundError,
 )
+from app.db.session import SessionLocal
 from app.modules.customers.models import Customer
 from app.modules.customers.schemas import CustomerCreate
-from app.modules.customers.service import create_customer
+from app.modules.customers.service import create_customer, get_customer
 from app.modules.departments.service import create_department
 from app.modules.opportunities.schemas import OpportunityCreate
 from app.modules.opportunities.service import create_opportunity
@@ -254,10 +255,84 @@ def test_claim_quota_is_enforced(db):
         claim_customer(db, ctx["sales1"], ctx["pool"].id, now=NOW)
 
 
+def test_claim_quota_counts_lost_customer(db):
+    """配额口径是“名下未删除客户”，lost 不豁免（裁定 7）。"""
+    ctx = _setup(db)
+    lost = create_customer(
+        db,
+        ctx["admin"],
+        CustomerCreate(name="已流失客户有限公司", owner_id=ctx["sales2"].id),
+    )
+    lost.status = "lost"
+    db.commit()
+    update_pool_rules(db, PoolRulesUpdate(max_owned=1))
+    # sales2 名下只有这条 lost 客户，仍占满 1 个配额。
+    with pytest.raises(ConflictError, match="上限"):
+        claim_customer(db, ctx["sales2"], ctx["pool"].id, now=NOW)
+
+
+def test_claim_quota_ignores_soft_deleted_customer(db):
+    """软删客户对外不存在，也不占配额。"""
+    ctx = _setup(db)
+    removed = create_customer(
+        db,
+        ctx["admin"],
+        CustomerCreate(name="已删除客户有限公司", owner_id=ctx["sales2"].id),
+    )
+    removed.deleted_at = datetime.now(UTC)
+    db.commit()
+    update_pool_rules(db, PoolRulesUpdate(max_owned=1))
+    claimed = claim_customer(db, ctx["sales2"], ctx["pool"].id, now=NOW)
+    assert claimed.owner_id == ctx["sales2"].id
+
+
 def test_claim_unknown_customer_is_404(db):
     ctx = _setup(db)
     with pytest.raises(NotFoundError):
         claim_customer(db, ctx["sales1"], 999_999, now=NOW)
+
+
+def test_claim_rechecks_owner_after_lock(db):
+    """并发赢家提交后，锁查询必须重新读行，而不是用 identity map 的旧值。
+
+    场景：本会话已把公海客户读进 identity map（owner_id=None）；另一个真实会话在
+    ``SELECT ... FOR UPDATE`` 之前提交了归属变更。``_lock_customer`` 带
+    ``populate_existing=True`` 时能读到新 owner 并 409；去掉它就会拿旧值继续写，
+    覆盖并发赢家（本测试转红）。
+    """
+    ctx = _setup(db)
+    # 先入 identity map，且此刻确实是公海（owner_id=None）。
+    assert get_customer(db, ctx["sales2"], ctx["pool"].id).owner_id is None
+
+    fired = False
+
+    def claim_by_other_before_lock(
+        conn, cursor, statement, parameters, context, executemany
+    ):
+        nonlocal fired
+        upper = statement.upper()
+        if fired or "FOR UPDATE" not in upper or "FROM CUSTOMERS" not in upper:
+            return
+        fired = True
+        # 第二个真实会话：模拟并发赢家先改归属并提交。
+        with SessionLocal() as other:
+            customer = other.get(Customer, ctx["pool"].id)
+            customer.owner_id = ctx["sales1"].id
+            customer.department_id = ctx["east"].id
+            other.commit()
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", claim_by_other_before_lock)
+    try:
+        with pytest.raises(ConflictError, match="已被他人领取"):
+            claim_customer(db, ctx["sales2"], ctx["pool"].id, now=NOW)
+    finally:
+        event.remove(engine, "before_cursor_execute", claim_by_other_before_lock)
+
+    assert fired, "行锁前没有触发并发归属变更，测试前提不成立"
+    # 输家不落库：归属仍是并发赢家 sales1。
+    db.rollback()
+    assert db.get(Customer, ctx["pool"].id).owner_id == ctx["sales1"].id
 
 
 def test_claim_issues_for_update_lock(db):
@@ -273,4 +348,9 @@ def test_claim_issues_for_update_lock(db):
         claim_customer(db, ctx["sales1"], ctx["pool"].id, now=NOW)
     finally:
         event.remove(engine, "before_cursor_execute", capture)
-    assert any("FOR UPDATE" in statement.upper() for statement in statements)
+    upper = [statement.upper() for statement in statements]
+    # 客户行锁：复查 owner 的前提。
+    assert any("FROM CUSTOMERS" in s and "FOR UPDATE" in s for s in upper)
+    # 目标用户行锁：并发领取同一销售的配额判定必须串行；只断言“有 FOR UPDATE”
+    # 会被客户行锁满足，删掉用户行锁也照样绿。
+    assert any("FROM USERS" in s and "FOR UPDATE" in s for s in upper)
