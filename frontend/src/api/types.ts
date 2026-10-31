@@ -259,6 +259,139 @@ export interface AssignableUser {
   quota_remaining: number;
 }
 
+/* ---------------------------------------------------------------------------
+ * 报表（P5）：与 `backend/app/modules/reports/schemas.py` 逐字一致。
+ *
+ * 金额（`amount` / `total_amount`）在 wire 上是 Decimal 序列化出的定点字符串，
+ * 前端只做展示（`formatAmount`），不参与计算；比率与天数在 `total = 0` 时后端
+ * 给 `null`，前端显示「—」而不是 0% 或 NaN。
+ * ------------------------------------------------------------------------ */
+
+export interface FunnelStage {
+  stage: string;
+  count: number;
+  amount: string;
+}
+
+export interface FunnelReport {
+  as_of: string;
+  stages: FunnelStage[];
+}
+
+export interface DepartmentRate {
+  department_id: number | null;
+  department_name: string;
+  won: number;
+  lost: number;
+  total: number;
+  rate: number | null;
+}
+
+export interface WinRateReport {
+  date_from: string;
+  date_to: string;
+  won: number;
+  lost: number;
+  total: number;
+  rate: number | null;
+  by_department: DepartmentRate[];
+}
+
+export interface CycleOwner {
+  owner_id: number;
+  owner_name: string;
+  won_count: number;
+  avg_days: number | null;
+}
+
+export interface CycleMonth {
+  month: string;
+  won_count: number;
+  avg_days: number | null;
+}
+
+export interface CycleReport {
+  date_from: string;
+  date_to: string;
+  won_count: number;
+  avg_days: number | null;
+  by_owner: CycleOwner[];
+  by_month: CycleMonth[];
+}
+
+export interface PerformanceOwner {
+  owner_id: number;
+  owner_name: string;
+  won_count: number;
+  amount: string;
+}
+
+export interface PerformanceMonth {
+  month: string;
+  won_count: number;
+  amount: string;
+}
+
+export interface PerformanceReport {
+  date_from: string;
+  date_to: string;
+  won_count: number;
+  total_amount: string;
+  by_owner: PerformanceOwner[];
+  by_month: PerformanceMonth[];
+}
+
+export interface ActivityOwner {
+  user_id: number;
+  user_name: string;
+  count: number;
+}
+
+export interface ActivityBucket {
+  bucket: string;
+  count: number;
+}
+
+export interface ActivityReport {
+  date_from: string;
+  date_to: string;
+  granularity: "day" | "week";
+  total: number;
+  by_owner: ActivityOwner[];
+  series: ActivityBucket[];
+}
+
+export interface LostReasonRow {
+  lost_reason_id: number;
+  lost_reason_name: string;
+  count: number;
+  amount: string;
+}
+
+export interface LostReasonReport {
+  date_from: string;
+  date_to: string;
+  total_count: number;
+  total_amount: string;
+  items: LostReasonRow[];
+}
+
+export interface CompetitorRow {
+  competitor: string;
+  count: number;
+  amount: string;
+  won: number;
+  lost: number;
+  rate: number | null;
+}
+
+export interface CompetitorReport {
+  date_from: string;
+  date_to: string;
+  total_opportunities: number;
+  items: CompetitorRow[];
+}
+
 /** 与后端 `PoolRuleRead` 逐字一致（snake_case，不转 camelCase）。 */
 export interface PoolRules {
   inactive_days: number;
